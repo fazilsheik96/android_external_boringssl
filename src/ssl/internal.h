@@ -396,13 +396,18 @@ uint16_t ssl_protocol_version(const SSL *ssl);
 // variant.
 bool ssl_is_draft21(uint16_t version);
 
+// ssl_is_draft22 returns whether the version corresponds to a draft22 TLS 1.3
+// variant.
+bool ssl_is_draft22(uint16_t version);
+
 // ssl_is_resumption_experiment returns whether the version corresponds to a
 // TLS 1.3 resumption experiment.
 bool ssl_is_resumption_experiment(uint16_t version);
 
-// ssl_is_resumption_variant returns whether the version corresponds to a
+// ssl_is_resumption_variant returns whether the variant corresponds to a
 // TLS 1.3 resumption experiment.
-bool ssl_is_resumption_variant(enum tls13_variant_t variant);
+bool ssl_is_resumption_variant(uint16_t max_version,
+                               enum tls13_variant_t variant);
 
 // ssl_is_resumption_client_ccs_experiment returns whether the version
 // corresponds to a TLS 1.3 resumption experiment that sends a client CCS.
@@ -1004,6 +1009,8 @@ struct SSLMessage {
 // Channel ID, are all enabled.
 #define SSL_MAX_HANDSHAKE_FLIGHT 7
 
+extern const uint8_t kHelloRetryRequest[SSL3_RANDOM_SIZE];
+
 // ssl_max_handshake_message_len returns the maximum number of bytes permitted
 // in a handshake message for |ssl|.
 size_t ssl_max_handshake_message_len(const SSL *ssl);
@@ -1238,10 +1245,10 @@ int tls13_derive_resumption_secret(SSL_HANDSHAKE *hs);
 
 // tls13_export_keying_material provides an exporter interface to use the
 // |exporter_secret|.
-int tls13_export_keying_material(SSL *ssl, uint8_t *out, size_t out_len,
-                                 const char *label, size_t label_len,
-                                 const uint8_t *context, size_t context_len,
-                                 int use_context);
+int tls13_export_keying_material(SSL *ssl, Span<uint8_t> out,
+                                 Span<const uint8_t> secret,
+                                 Span<const char> label,
+                                 Span<const uint8_t> context);
 
 // tls13_finished_mac calculates the MAC of the handshake transcript to verify
 // the integrity of the Finished message, and stores the result in |out| and
@@ -1438,6 +1445,7 @@ struct SSL_HANDSHAKE {
   bool needs_psk_binder:1;
 
   bool received_hello_retry_request:1;
+  bool sent_hello_retry_request:1;
 
   bool received_custom_extension:1;
 
@@ -2158,21 +2166,24 @@ struct SSLContext {
   // If true, a client will request certificate timestamps.
   bool signed_cert_timestamps_enabled:1;
 
-  // tlsext_channel_id_enabled is one if Channel ID is enabled and zero
-  // otherwise. For a server, means that we'll accept Channel IDs from clients.
-  // For a client, means that we'll advertise support.
+  // tlsext_channel_id_enabled is whether Channel ID is enabled. For a server,
+  // means that we'll accept Channel IDs from clients.  For a client, means that
+  // we'll advertise support.
   bool tlsext_channel_id_enabled:1;
 
-  // grease_enabled is one if draft-davidben-tls-grease-01 is enabled and zero
-  // otherwise.
+  // grease_enabled is whether draft-davidben-tls-grease-01 is enabled.
   bool grease_enabled:1;
 
-  // allow_unknown_alpn_protos is one if the client allows unsolicited ALPN
+  // allow_unknown_alpn_protos is whether the client allows unsolicited ALPN
   // protocols from the peer.
   bool allow_unknown_alpn_protos:1;
 
-  // ed25519_enabled is one if Ed25519 is advertised in the handshake.
+  // ed25519_enabled is whether Ed25519 is advertised in the handshake.
   bool ed25519_enabled:1;
+
+  // false_start_allowed_without_alpn is whether False Start (if
+  // |SSL_MODE_ENABLE_FALSE_START| is enabled) is allowed without ALPN.
+  bool false_start_allowed_without_alpn:1;
 };
 
 // An ssl_shutdown_t describes the shutdown state of one end of the connection,

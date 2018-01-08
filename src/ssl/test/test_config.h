@@ -26,7 +26,6 @@ struct TestConfig {
   int resume_count = 0;
   std::string write_settings;
   bool fallback_scsv = false;
-  std::string digest_prefs;
   std::vector<int> signing_prefs;
   std::vector<int> verify_prefs;
   std::string key_file;
@@ -80,6 +79,7 @@ struct TestConfig {
   bool fail_cert_callback = false;
   std::string cipher;
   bool handshake_never_done = false;
+  int export_early_keying_material = 0;
   int export_keying_material = 0;
   std::string export_label;
   std::string export_context;
@@ -145,6 +145,7 @@ struct TestConfig {
   bool enable_ed25519 = false;
   bool use_custom_verify_callback = false;
   std::string expect_msg_callback;
+  bool allow_false_start_without_alpn = false;
 };
 
 bool ParseConfig(int argc, char **argv, TestConfig *out_initial,

@@ -358,10 +358,17 @@ func (hs *serverHandshakeState) doTLS13Handshake() error {
 	c := hs.c
 	config := c.config
 
+	// We've read the ClientHello, so the next record in draft 22 must be
+	// preceded with ChangeCipherSpec.
+	if isDraft22(c.wireVersion) {
+		c.expectTLS13ChangeCipherSpec = true
+	}
+
 	hs.hello = &serverHelloMsg{
 		isDTLS:                c.isDTLS,
 		vers:                  c.wireVersion,
 		sessionId:             hs.clientHello.sessionId,
+		compressionMethod:     config.Bugs.SendCompressionMethod,
 		versOverride:          config.Bugs.SendServerHelloVersion,
 		supportedVersOverride: config.Bugs.SendServerSupportedExtensionVersion,
 		customExtension:       config.Bugs.CustomUnencryptedExtension,
@@ -526,7 +533,9 @@ ResendHelloRetryRequest:
 	}
 	helloRetryRequest := &helloRetryRequestMsg{
 		vers:                c.wireVersion,
+		sessionId:           hs.clientHello.sessionId,
 		cipherSuite:         cipherSuite,
+		compressionMethod:   config.Bugs.SendCompressionMethod,
 		duplicateExtensions: config.Bugs.DuplicateHelloRetryRequestExtensions,
 	}
 
@@ -586,6 +595,10 @@ ResendHelloRetryRequest:
 		hs.writeServerHash(helloRetryRequest.marshal())
 		c.writeRecord(recordTypeHandshake, helloRetryRequest.marshal())
 		c.flushHandshake()
+
+		if !c.config.Bugs.SkipChangeCipherSpec && isDraft22(c.wireVersion) {
+			c.writeRecord(recordTypeChangeCipherSpec, []byte{1})
+		}
 
 		if hs.clientHello.hasEarlyData {
 			c.skipEarlyData = true
@@ -681,22 +694,36 @@ ResendHelloRetryRequest:
 			}
 		}
 		if encryptedExtensions.extensions.hasEarlyData {
-			earlyLabel := earlyTrafficLabel
+			var earlyTrafficSecret []byte
 			if isDraft21(c.wireVersion) {
-				earlyLabel = earlyTrafficLabelDraft21
+				earlyTrafficSecret = hs.finishedHash.deriveSecret(earlyTrafficLabelDraft21)
+				c.earlyExporterSecret = hs.finishedHash.deriveSecret(earlyExporterLabelDraft21)
+			} else {
+				earlyTrafficSecret = hs.finishedHash.deriveSecret(earlyTrafficLabel)
+				c.earlyExporterSecret = hs.finishedHash.deriveSecret(earlyExporterLabel)
 			}
 
-			earlyTrafficSecret := hs.finishedHash.deriveSecret(earlyLabel)
 			if err := c.useInTrafficSecret(c.wireVersion, hs.suite, earlyTrafficSecret); err != nil {
 				return err
 			}
 
-			for _, expectedMsg := range config.Bugs.ExpectEarlyData {
+			c.earlyCipherSuite = hs.suite
+			expectEarlyData := config.Bugs.ExpectEarlyData
+			if n := config.Bugs.ExpectEarlyKeyingMaterial; n > 0 {
+				exporter, err := c.ExportEarlyKeyingMaterial(n, []byte(config.Bugs.ExpectEarlyKeyingLabel), []byte(config.Bugs.ExpectEarlyKeyingContext))
+				if err != nil {
+					return err
+				}
+				expectEarlyData = append([][]byte{exporter}, expectEarlyData...)
+			}
+
+			for _, expectedMsg := range expectEarlyData {
 				if err := c.readRecord(recordTypeApplicationData); err != nil {
 					return err
 				}
-				if !bytes.Equal(c.input.data[c.input.off:], expectedMsg) {
-					return errors.New("ExpectEarlyData: did not get expected message")
+				msg := c.input.data[c.input.off:]
+				if !bytes.Equal(msg, expectedMsg) {
+					return fmt.Errorf("tls: got early data record %x, wanted %x", msg, expectedMsg)
 				}
 				c.in.freeBlock(c.input)
 				c.input = nil
@@ -782,7 +809,11 @@ ResendHelloRetryRequest:
 	}
 	c.flushHandshake()
 
-	if isResumptionExperiment(c.wireVersion) {
+	if !c.config.Bugs.SkipChangeCipherSpec && isResumptionExperiment(c.wireVersion) && !sendHelloRetryRequest {
+		c.writeRecord(recordTypeChangeCipherSpec, []byte{1})
+	}
+
+	for i := 0; i < c.config.Bugs.SendExtraChangeCipherSpec; i++ {
 		c.writeRecord(recordTypeChangeCipherSpec, []byte{1})
 	}
 
@@ -981,11 +1012,10 @@ ResendHelloRetryRequest:
 			}
 		}
 	}
-
-	if isResumptionClientCCSExperiment(c.wireVersion) && !c.skipEarlyData {
-		if err := c.readRecord(recordTypeChangeCipherSpec); err != nil {
-			return err
-		}
+	if isResumptionClientCCSExperiment(c.wireVersion) && !isDraft22(c.wireVersion) && !hs.clientHello.hasEarlyData {
+		// Early versions of the middlebox hacks inserted
+		// ChangeCipherSpec differently on 0-RTT and 2-RTT handshakes.
+		c.expectTLS13ChangeCipherSpec = true
 	}
 
 	// Switch input stream to handshake traffic keys.

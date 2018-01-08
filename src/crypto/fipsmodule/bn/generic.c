@@ -64,7 +64,8 @@
 // This file has two other implementations: x86 assembly language in
 // asm/bn-586.pl and x86_64 inline assembly in asm/x86_64-gcc.c.
 #if defined(OPENSSL_NO_ASM) || \
-    !(defined(OPENSSL_X86) || (defined(OPENSSL_X86_64) && defined(__GNUC__)))
+    !(defined(OPENSSL_X86) ||  \
+      (defined(OPENSSL_X86_64) && (defined(__GNUC__) || defined(__clang__))))
 
 #ifdef BN_ULLONG
 #define mul_add(r, a, w, c)               \
@@ -124,12 +125,11 @@
 
 #endif  // !BN_ULLONG
 
-BN_ULONG bn_mul_add_words(BN_ULONG *rp, const BN_ULONG *ap, int num,
+BN_ULONG bn_mul_add_words(BN_ULONG *rp, const BN_ULONG *ap, size_t num,
                           BN_ULONG w) {
   BN_ULONG c1 = 0;
 
-  assert(num >= 0);
-  if (num <= 0) {
+  if (num == 0) {
     return c1;
   }
 
@@ -153,11 +153,11 @@ BN_ULONG bn_mul_add_words(BN_ULONG *rp, const BN_ULONG *ap, int num,
   return c1;
 }
 
-BN_ULONG bn_mul_words(BN_ULONG *rp, const BN_ULONG *ap, int num, BN_ULONG w) {
+BN_ULONG bn_mul_words(BN_ULONG *rp, const BN_ULONG *ap, size_t num,
+                      BN_ULONG w) {
   BN_ULONG c1 = 0;
 
-  assert(num >= 0);
-  if (num <= 0) {
+  if (num == 0) {
     return c1;
   }
 
@@ -179,9 +179,8 @@ BN_ULONG bn_mul_words(BN_ULONG *rp, const BN_ULONG *ap, int num, BN_ULONG w) {
   return c1;
 }
 
-void bn_sqr_words(BN_ULONG *r, const BN_ULONG *a, int n) {
-  assert(n >= 0);
-  if (n <= 0) {
+void bn_sqr_words(BN_ULONG *r, const BN_ULONG *a, size_t n) {
+  if (n == 0) {
     return;
   }
 
@@ -204,11 +203,10 @@ void bn_sqr_words(BN_ULONG *r, const BN_ULONG *a, int n) {
 
 #ifdef BN_ULLONG
 BN_ULONG bn_add_words(BN_ULONG *r, const BN_ULONG *a, const BN_ULONG *b,
-                      int n) {
+                      size_t n) {
   BN_ULLONG ll = 0;
 
-  assert(n >= 0);
-  if (n <= 0) {
+  if (n == 0) {
     return 0;
   }
 
@@ -245,11 +243,10 @@ BN_ULONG bn_add_words(BN_ULONG *r, const BN_ULONG *a, const BN_ULONG *b,
 #else  // !BN_ULLONG
 
 BN_ULONG bn_add_words(BN_ULONG *r, const BN_ULONG *a, const BN_ULONG *b,
-                      int n) {
+                      size_t n) {
   BN_ULONG c, l, t;
 
-  assert(n >= 0);
-  if (n <= 0) {
+  if (n == 0) {
     return (BN_ULONG)0;
   }
 
@@ -302,12 +299,11 @@ BN_ULONG bn_add_words(BN_ULONG *r, const BN_ULONG *a, const BN_ULONG *b,
 #endif  // !BN_ULLONG
 
 BN_ULONG bn_sub_words(BN_ULONG *r, const BN_ULONG *a, const BN_ULONG *b,
-                      int n) {
+                      size_t n) {
   BN_ULONG t1, t2;
   int c = 0;
 
-  assert(n >= 0);
-  if (n <= 0) {
+  if (n == 0) {
     return (BN_ULONG)0;
   }
 
@@ -458,7 +454,7 @@ BN_ULONG bn_sub_words(BN_ULONG *r, const BN_ULONG *a, const BN_ULONG *b,
 
 #endif  // !BN_ULLONG
 
-void bn_mul_comba8(BN_ULONG *r, BN_ULONG *a, BN_ULONG *b) {
+void bn_mul_comba8(BN_ULONG r[16], const BN_ULONG a[8], const BN_ULONG b[8]) {
   BN_ULONG c1, c2, c3;
 
   c1 = 0;
@@ -560,7 +556,7 @@ void bn_mul_comba8(BN_ULONG *r, BN_ULONG *a, BN_ULONG *b) {
   r[15] = c1;
 }
 
-void bn_mul_comba4(BN_ULONG *r, BN_ULONG *a, BN_ULONG *b) {
+void bn_mul_comba4(BN_ULONG r[8], const BN_ULONG a[4], const BN_ULONG b[4]) {
   BN_ULONG c1, c2, c3;
 
   c1 = 0;
@@ -598,7 +594,7 @@ void bn_mul_comba4(BN_ULONG *r, BN_ULONG *a, BN_ULONG *b) {
   r[7] = c2;
 }
 
-void bn_sqr_comba8(BN_ULONG *r, const BN_ULONG *a) {
+void bn_sqr_comba8(BN_ULONG r[16], const BN_ULONG a[8]) {
   BN_ULONG c1, c2, c3;
 
   c1 = 0;
@@ -672,7 +668,7 @@ void bn_sqr_comba8(BN_ULONG *r, const BN_ULONG *a) {
   r[15] = c1;
 }
 
-void bn_sqr_comba4(BN_ULONG *r, const BN_ULONG *a) {
+void bn_sqr_comba4(BN_ULONG r[8], const BN_ULONG a[4]) {
   BN_ULONG c1, c2, c3;
 
   c1 = 0;

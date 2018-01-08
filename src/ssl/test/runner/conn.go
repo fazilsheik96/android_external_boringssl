@@ -44,6 +44,7 @@ type Conn struct {
 	didResume            bool // whether this connection was a session resumption
 	extendedMasterSecret bool // whether this session used an extended master secret
 	cipherSuite          *cipherSuite
+	earlyCipherSuite     *cipherSuite
 	ocspResponse         []byte // stapled OCSP response
 	sctList              []byte // signed certificate timestamp list
 	peerCertificates     []*x509.Certificate
@@ -63,6 +64,7 @@ type Conn struct {
 	curveID CurveID
 
 	clientRandom, serverRandom [32]byte
+	earlyExporterSecret        []byte
 	exporterSecret             []byte
 	resumptionSecret           []byte
 
@@ -100,6 +102,8 @@ type Conn struct {
 
 	keyUpdateRequested bool
 	seenOneByteRecord  bool
+
+	expectTLS13ChangeCipherSpec bool
 
 	tmp [16]byte
 }
@@ -877,6 +881,47 @@ RestartReadRecord:
 	return typ, b, nil
 }
 
+func (c *Conn) readTLS13ChangeCipherSpec() error {
+	if !c.expectTLS13ChangeCipherSpec {
+		panic("c.expectTLS13ChangeCipherSpec not set")
+	}
+
+	// Read the ChangeCipherSpec.
+	if c.rawInput == nil {
+		c.rawInput = c.in.newBlock()
+	}
+	b := c.rawInput
+	if err := b.readFromUntil(c.conn, 1); err != nil {
+		return c.in.setErrorLocked(fmt.Errorf("tls: error reading TLS 1.3 ChangeCipherSpec: %s", err))
+	}
+	if recordType(b.data[0]) == recordTypeAlert {
+		// If the client is sending an alert, allow the ChangeCipherSpec
+		// to be skipped. It may be rejecting a sufficiently malformed
+		// ServerHello that it can't parse out the version.
+		c.expectTLS13ChangeCipherSpec = false
+		return nil
+	}
+	if err := b.readFromUntil(c.conn, 6); err != nil {
+		return c.in.setErrorLocked(fmt.Errorf("tls: error reading TLS 1.3 ChangeCipherSpec: %s", err))
+	}
+
+	// Check they match that we expect.
+	expected := [6]byte{byte(recordTypeChangeCipherSpec), 3, 1, 0, 1, 1}
+	if isResumptionRecordVersionExperiment(c.wireVersion) {
+		expected[2] = 3
+	}
+	if !bytes.Equal(b.data[:6], expected[:]) {
+		return c.in.setErrorLocked(fmt.Errorf("tls: error invalid TLS 1.3 ChangeCipherSpec: %x", b.data[:6]))
+	}
+
+	// Discard the data.
+	b, c.rawInput = c.in.splitBlock(b, 6)
+	c.in.freeBlock(b)
+
+	c.expectTLS13ChangeCipherSpec = false
+	return nil
+}
+
 // readRecord reads the next TLS record from the connection
 // and updates the record layer state.
 // c.in.Mutex <= L; c.input == nil.
@@ -895,6 +940,12 @@ func (c *Conn) readRecord(want recordType) error {
 		}
 	case recordTypeApplicationData, recordTypeAlert, recordTypeHandshake:
 		break
+	}
+
+	if c.expectTLS13ChangeCipherSpec {
+		if err := c.readTLS13ChangeCipherSpec(); err != nil {
+			return err
+		}
 	}
 
 Again:
@@ -951,14 +1002,12 @@ Again:
 			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 			break
 		}
-		if !isResumptionExperiment(c.wireVersion) {
-			if c.hand.Len() != 0 {
-				c.in.setErrorLocked(errors.New("tls: buffered handshake messages on cipher change"))
-				break
-			}
-			if err := c.in.changeCipherSpec(c.config); err != nil {
-				c.in.setErrorLocked(c.sendAlert(err.(alert)))
-			}
+		if c.hand.Len() != 0 {
+			c.in.setErrorLocked(errors.New("tls: buffered handshake messages on cipher change"))
+			break
+		}
+		if err := c.in.changeCipherSpec(c.config); err != nil {
+			c.in.setErrorLocked(c.sendAlert(err.(alert)))
 		}
 
 	case recordTypeApplicationData:
@@ -1088,6 +1137,12 @@ func (c *Conn) writeRecord(typ recordType, data []byte) (n int, err error) {
 		return 0, err
 	}
 
+	if typ == recordTypeApplicationData && c.config.Bugs.SendPostHandshakeChangeCipherSpec {
+		if _, err := c.doWriteRecord(recordTypeChangeCipherSpec, []byte{1}); err != nil {
+			return 0, err
+		}
+	}
+
 	return c.doWriteRecord(typ, data)
 }
 
@@ -1152,7 +1207,6 @@ func (c *Conn) doWriteRecord(typ recordType, data []byte) (n int, err error) {
 		}
 		if isResumptionRecordVersionExperiment(c.wireVersion) || isResumptionRecordVersionExperiment(c.out.wireVersion) {
 			vers = VersionTLS12
-		} else {
 		}
 
 		if c.config.Bugs.SendRecordVersion != 0 {
@@ -1322,8 +1376,16 @@ func (c *Conn) readHandshake() (interface{}, error) {
 	// so pass in a fresh copy that won't be overwritten.
 	data = append([]byte(nil), data...)
 
+	if data[0] == typeServerHello && len(data) >= 38 {
+		vers := uint16(data[4])<<8 | uint16(data[5])
+		if vers == VersionTLS12 && bytes.Equal(data[6:38], tls13HelloRetryRequest) {
+			m = new(helloRetryRequestMsg)
+			m.(*helloRetryRequestMsg).isServerHello = true
+		}
+	}
+
 	if !m.unmarshal(data) {
-		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		return nil, c.in.setErrorLocked(c.sendAlert(alertDecodeError))
 	}
 	return m, nil
 }
@@ -1787,6 +1849,23 @@ func (c *Conn) VerifyHostname(host string) error {
 	return c.peerCertificates[0].VerifyHostname(host)
 }
 
+func (c *Conn) exportKeyingMaterialTLS13(length int, secret, label, context []byte) []byte {
+	cipherSuite := c.cipherSuite
+	if cipherSuite == nil {
+		cipherSuite = c.earlyCipherSuite
+	}
+	if isDraft21(c.wireVersion) {
+		hash := cipherSuite.hash()
+		exporterKeyingLabel := []byte("exporter")
+		contextHash := hash.New()
+		contextHash.Write(context)
+		exporterContext := hash.New().Sum(nil)
+		derivedSecret := hkdfExpandLabel(cipherSuite.hash(), c.wireVersion, secret, label, exporterContext, hash.Size())
+		return hkdfExpandLabel(cipherSuite.hash(), c.wireVersion, derivedSecret, exporterKeyingLabel, contextHash.Sum(nil), length)
+	}
+	return hkdfExpandLabel(cipherSuite.hash(), c.wireVersion, secret, label, context, length)
+}
+
 // ExportKeyingMaterial exports keying material from the current connection
 // state, as per RFC 5705.
 func (c *Conn) ExportKeyingMaterial(length int, label, context []byte, useContext bool) ([]byte, error) {
@@ -1797,16 +1876,7 @@ func (c *Conn) ExportKeyingMaterial(length int, label, context []byte, useContex
 	}
 
 	if c.vers >= VersionTLS13 {
-		if isDraft21(c.wireVersion) {
-			hash := c.cipherSuite.hash()
-			exporterKeyingLabel := []byte("exporter")
-			contextHash := hash.New()
-			contextHash.Write(context)
-			exporterContext := hash.New().Sum(nil)
-			derivedSecret := hkdfExpandLabel(c.cipherSuite.hash(), c.wireVersion, c.exporterSecret, label, exporterContext, hash.Size())
-			return hkdfExpandLabel(c.cipherSuite.hash(), c.wireVersion, derivedSecret, exporterKeyingLabel, contextHash.Sum(nil), length), nil
-		}
-		return hkdfExpandLabel(c.cipherSuite.hash(), c.wireVersion, c.exporterSecret, label, context, length), nil
+		return c.exportKeyingMaterialTLS13(length, c.exporterSecret, label, context), nil
 	}
 
 	seedLen := len(c.clientRandom) + len(c.serverRandom)
@@ -1823,6 +1893,18 @@ func (c *Conn) ExportKeyingMaterial(length int, label, context []byte, useContex
 	result := make([]byte, length)
 	prfForVersion(c.vers, c.cipherSuite)(result, c.exporterSecret, label, seed)
 	return result, nil
+}
+
+func (c *Conn) ExportEarlyKeyingMaterial(length int, label, context []byte) ([]byte, error) {
+	if c.vers < VersionTLS13 {
+		return nil, errors.New("tls: early exporters not defined before TLS 1.3")
+	}
+
+	if c.earlyExporterSecret == nil {
+		return nil, errors.New("tls: no early exporter secret")
+	}
+
+	return c.exportKeyingMaterialTLS13(length, c.earlyExporterSecret, label, context), nil
 }
 
 // noRenegotiationInfo returns true if the renegotiation info extension
@@ -1936,7 +2018,7 @@ func (c *Conn) sendFakeEarlyData(len int) error {
 	payload[0] = byte(recordTypeApplicationData)
 	payload[1] = 3
 	payload[2] = 1
-	if c.config.TLS13Variant == TLS13Experiment2 || c.config.TLS13Variant == TLS13Experiment3 {
+	if isResumptionRecordVersionVariant(c.config.TLS13Variant) {
 		payload[1] = 3
 		payload[2] = 3
 	}

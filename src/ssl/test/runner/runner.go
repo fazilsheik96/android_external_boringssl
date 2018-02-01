@@ -343,6 +343,12 @@ type testCase struct {
 	// expectChannelID controls whether the connection should have
 	// negotiated a Channel ID with channelIDKey.
 	expectChannelID bool
+	// expectTokenBinding controls whether the connection should have
+	// negotiated Token Binding.
+	expectTokenBinding bool
+	// expectedTokenBindingParam is the Token Binding parameter that should
+	// have been negotiated (if expectTokenBinding is true).
+	expectedTokenBindingParam uint8
 	// expectedNextProto controls whether the connection should
 	// negotiate a next protocol via NPN or ALPN.
 	expectedNextProto string
@@ -648,6 +654,17 @@ func doExchange(test *testCase, config *Config, conn net.Conn, isResume bool, tr
 		return fmt.Errorf("channel ID unexpectedly negotiated")
 	}
 
+	if test.expectTokenBinding {
+		if !connState.TokenBindingNegotiated {
+			return errors.New("no Token Binding negotiated")
+		}
+		if connState.TokenBindingParam != test.expectedTokenBindingParam {
+			return fmt.Errorf("expected param %02x, but got %02x", test.expectedTokenBindingParam, connState.TokenBindingParam)
+		}
+	} else if connState.TokenBindingNegotiated {
+		return errors.New("Token Binding unexpectedly negotiated")
+	}
+
 	if expected := test.expectedNextProto; expected != "" {
 		if actual := connState.NegotiatedProtocol; actual != expected {
 			return fmt.Errorf("next proto mismatch: got %s, wanted %s", actual, expected)
@@ -907,6 +924,17 @@ func lldbOf(path string, args ...string) *exec.Cmd {
 	xtermArgs = append(xtermArgs, args...)
 
 	return exec.Command("xterm", xtermArgs...)
+}
+
+func removeFirstLineIfSuffix(s, suffix string) string {
+	idx := strings.IndexByte(s, '\n')
+	if idx < 0 {
+		return s
+	}
+	if strings.HasSuffix(s[:idx], suffix) {
+		return s[idx+1:]
+	}
+	return s
 }
 
 var (
@@ -1206,6 +1234,18 @@ func runTest(test *testCase, shimPath string, mallocNumToFail int64) error {
 	stdout := strings.Replace(string(stdoutBuf.Bytes()), "\r\n", "\n", -1)
 	stderr := strings.Replace(string(stderrBuf.Bytes()), "\r\n", "\n", -1)
 
+	// Work around an NDK / Android bug. The NDK r16 sometimes generates
+	// binaries with the DF_1_PIE, which the runtime linker on Android N
+	// complains about. The next NDK revision should work around this but,
+	// in the meantime, strip its error out.
+	//
+	// https://github.com/android-ndk/ndk/issues/602
+	// https://android-review.googlesource.com/c/platform/bionic/+/259790
+	// https://android-review.googlesource.com/c/toolchain/binutils/+/571550
+	//
+	// Remove this after switching to the r17 NDK.
+	stderr = removeFirstLineIfSuffix(stderr, ": unsupported flags DT_FLAGS_1=0x8000001")
+
 	// Separate the errors from the shim and those from tools like
 	// AddressSanitizer.
 	var extraStderr string
@@ -1326,6 +1366,13 @@ var tlsVersions = []tlsVersion{
 		excludeFlag:  "-no-tls13",
 		versionWire:  tls13Draft22Version,
 		tls13Variant: TLS13Draft22,
+	},
+	{
+		name:         "TLS13Draft23",
+		version:      VersionTLS13,
+		excludeFlag:  "-no-tls13",
+		versionWire:  tls13Draft23Version,
+		tls13Variant: TLS13Draft23,
 	},
 	{
 		name:         "TLS13Experiment2",
@@ -5306,7 +5353,7 @@ func addVersionNegotiationTests() {
 				expectedClientVersion := expectedVersion
 				if expectedVersion == VersionTLS13 && runnerVers.tls13Variant != shimVers.tls13Variant {
 					expectedClientVersion = VersionTLS12
-					if shimVers.tls13Variant == TLS13Draft22 {
+					if shimVers.tls13Variant == TLS13Draft23 {
 						expectedServerVersion = VersionTLS12
 					}
 				}
@@ -5516,7 +5563,7 @@ func addVersionNegotiationTests() {
 		name:     "IgnoreClientVersionOrder",
 		config: Config{
 			Bugs: ProtocolBugs{
-				SendSupportedVersions: []uint16{VersionTLS12, tls13Draft22Version},
+				SendSupportedVersions: []uint16{VersionTLS12, tls13Draft23Version},
 			},
 		},
 		expectedVersion: VersionTLS13,
@@ -6123,6 +6170,404 @@ func addExtensionTests() {
 				tls13Variant:  ver.tls13Variant,
 				shouldFail:    true,
 				expectedError: ":NEGOTIATED_BOTH_NPN_AND_ALPN:",
+			})
+		}
+
+		// Test Token Binding.
+
+		const maxTokenBindingVersion = 16
+		const minTokenBindingVersion = 13
+		testCases = append(testCases, testCase{
+			testType: serverTest,
+			name:     "TokenBinding-Server-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{0, 1, 2},
+				TokenBindingVersion: maxTokenBindingVersion,
+			},
+			expectTokenBinding: true,
+			expectedTokenBindingParam: 2,
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				"-expected-token-binding-param",
+				"2",
+			},
+		})
+		testCases = append(testCases, testCase{
+			testType: serverTest,
+			name:     "TokenBinding-Server-UnsupportedParam-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{3},
+				TokenBindingVersion: maxTokenBindingVersion,
+			},
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+			},
+		})
+		testCases = append(testCases, testCase{
+			testType: serverTest,
+			name:     "TokenBinding-Server-OldVersion-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{0, 1, 2},
+				TokenBindingVersion: minTokenBindingVersion - 1,
+			},
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+			},
+		})
+		testCases = append(testCases, testCase{
+			testType: serverTest,
+			name:     "TokenBinding-Server-NewVersion-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{0, 1, 2},
+				TokenBindingVersion: maxTokenBindingVersion + 1,
+			},
+			expectTokenBinding: true,
+			expectedTokenBindingParam: 2,
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				"-expected-token-binding-param",
+				"2",
+			},
+		})
+		testCases = append(testCases, testCase{
+			testType: serverTest,
+			name:     "TokenBinding-Server-NoParams-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{},
+				TokenBindingVersion: maxTokenBindingVersion,
+			},
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+			},
+			shouldFail: true,
+			expectedError: ":ERROR_PARSING_EXTENSION:",
+		})
+		testCases = append(testCases, testCase{
+			testType: serverTest,
+			name:     "TokenBinding-Server-RepeatedParam" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{0, 1, 2, 2},
+				TokenBindingVersion: maxTokenBindingVersion,
+			},
+			expectTokenBinding: true,
+			expectedTokenBindingParam: 2,
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				"-expected-token-binding-param",
+				"2",
+			},
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{2},
+				TokenBindingVersion: maxTokenBindingVersion,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			tls13Variant: ver.tls13Variant,
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+				"-expected-token-binding-param",
+				"2",
+			},
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-Unexpected-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{2},
+				TokenBindingVersion: maxTokenBindingVersion,
+			},
+			tls13Variant: ver.tls13Variant,
+			shouldFail: true,
+			expectedError: ":UNEXPECTED_EXTENSION:",
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-ExtraParams-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{2, 1},
+				TokenBindingVersion: maxTokenBindingVersion,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+				"-expected-token-binding-param",
+				"2",
+			},
+			tls13Variant: ver.tls13Variant,
+			shouldFail: true,
+			expectedError: ":ERROR_PARSING_EXTENSION:",
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-NoParams-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{},
+				TokenBindingVersion: maxTokenBindingVersion,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+				"-expected-token-binding-param",
+				"2",
+			},
+			tls13Variant: ver.tls13Variant,
+			shouldFail: true,
+			expectedError: ":ERROR_PARSING_EXTENSION:",
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-WrongParam-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{3},
+				TokenBindingVersion: maxTokenBindingVersion,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+				"-expected-token-binding-param",
+				"2",
+			},
+			tls13Variant: ver.tls13Variant,
+			shouldFail: true,
+			expectedError: ":ERROR_PARSING_EXTENSION:",
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-OldVersion-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{2},
+				TokenBindingVersion: minTokenBindingVersion - 1,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+			},
+			tls13Variant: ver.tls13Variant,
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-MinVersion-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{2},
+				TokenBindingVersion: minTokenBindingVersion,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+				"-expected-token-binding-param",
+				"2",
+			},
+			tls13Variant: ver.tls13Variant,
+		})
+		testCases = append(testCases, testCase{
+			testType: clientTest,
+			name:     "TokenBinding-Client-VersionTooNew-" + ver.name,
+
+			config: Config{
+				MinVersion: ver.version,
+				MaxVersion: ver.version,
+				TokenBindingParams: []byte{2},
+				TokenBindingVersion: maxTokenBindingVersion + 1,
+				ExpectTokenBindingParams: []byte{0, 1, 2},
+			},
+			flags: []string{
+				"-token-binding-params",
+				base64.StdEncoding.EncodeToString([]byte{0, 1, 2}),
+			},
+			tls13Variant: ver.tls13Variant,
+			shouldFail: true,
+			expectedError: "ERROR_PARSING_EXTENSION",
+		})
+		if ver.version < VersionTLS13 {
+			testCases = append(testCases, testCase{
+				testType: clientTest,
+				name:     "TokenBinding-Client-NoEMS-" + ver.name,
+
+				config: Config{
+					MinVersion: ver.version,
+					MaxVersion: ver.version,
+					TokenBindingParams: []byte{2},
+					TokenBindingVersion: maxTokenBindingVersion,
+					ExpectTokenBindingParams: []byte{2, 1, 0},
+					Bugs: ProtocolBugs{
+						NoExtendedMasterSecret: true,
+					},
+				},
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-token-binding-params",
+					base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				},
+				shouldFail: true,
+				expectedError: ":NEGOTIATED_TB_WITHOUT_EMS_OR_RI:",
+			})
+			testCases = append(testCases, testCase{
+				testType: serverTest,
+				name:     "TokenBinding-Server-NoEMS-" + ver.name,
+
+				config: Config{
+					MinVersion: ver.version,
+					MaxVersion: ver.version,
+					TokenBindingParams: []byte{0, 1, 2},
+					TokenBindingVersion: maxTokenBindingVersion,
+					Bugs: ProtocolBugs{
+						NoExtendedMasterSecret: true,
+					},
+				},
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-token-binding-params",
+					base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				},
+				shouldFail: true,
+				expectedError: ":NEGOTIATED_TB_WITHOUT_EMS_OR_RI:",
+			})
+			testCases = append(testCases, testCase{
+				testType: clientTest,
+				name:     "TokenBinding-Client-NoRI-" + ver.name,
+
+				config: Config{
+					MinVersion: ver.version,
+					MaxVersion: ver.version,
+					TokenBindingParams: []byte{2},
+					TokenBindingVersion: maxTokenBindingVersion,
+					ExpectTokenBindingParams: []byte{2, 1, 0},
+					Bugs: ProtocolBugs{
+						NoRenegotiationInfo: true,
+					},
+				},
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-token-binding-params",
+					base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				},
+				shouldFail: true,
+				expectedError: ":NEGOTIATED_TB_WITHOUT_EMS_OR_RI:",
+			})
+			testCases = append(testCases, testCase{
+				testType: serverTest,
+				name:     "TokenBinding-Server-NoRI-" + ver.name,
+
+				config: Config{
+					MinVersion: ver.version,
+					MaxVersion: ver.version,
+					TokenBindingParams: []byte{0, 1, 2},
+					TokenBindingVersion: maxTokenBindingVersion,
+					Bugs: ProtocolBugs{
+						NoRenegotiationInfo: true,
+					},
+				},
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-token-binding-params",
+					base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				},
+				shouldFail:    true,
+				expectedError: ":NEGOTIATED_TB_WITHOUT_EMS_OR_RI:",
+			})
+		} else {
+			testCases = append(testCases, testCase{
+				testType: clientTest,
+				name:     "TokenBinding-WithEarlyDataFails-" + ver.name,
+				config: Config{
+					MinVersion: ver.version,
+					MaxVersion: ver.version,
+					TokenBindingParams: []byte{2},
+					TokenBindingVersion: maxTokenBindingVersion,
+					ExpectTokenBindingParams: []byte{2, 1, 0},
+					MaxEarlyDataSize: 16384,
+				},
+				resumeSession: true,
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-enable-early-data",
+					"-expect-ticket-supports-early-data",
+					"-token-binding-params",
+					base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				},
+				shouldFail: true,
+				expectedError: ":UNEXPECTED_EXTENSION_ON_EARLY_DATA:",
+			})
+			testCases = append(testCases, testCase{
+				testType: serverTest,
+				name:     "TokenBinding-EarlyDataRejected-" + ver.name,
+				config: Config{
+					MinVersion: ver.version,
+					MaxVersion: ver.version,
+					TokenBindingParams: []byte{0, 1, 2},
+					TokenBindingVersion: maxTokenBindingVersion,
+					MaxEarlyDataSize: 16384,
+				},
+				resumeSession: true,
+				expectTokenBinding: true,
+				expectedTokenBindingParam: 2,
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-enable-early-data",
+					"-expect-ticket-supports-early-data",
+					"-token-binding-params",
+					base64.StdEncoding.EncodeToString([]byte{2, 1, 0}),
+				},
 			})
 		}
 
@@ -6750,6 +7195,32 @@ func addExtensionTests() {
 		shouldFail:    true,
 		expectedError: ":INVALID_SCT_LIST:",
 	})
+
+	for _, version := range allVersions(tls) {
+		if version.version < VersionTLS12 {
+			continue
+		}
+
+		for _, paddingLen := range []int{1, 9700} {
+			flags := []string{
+				"-max-version", version.shimFlag(tls),
+				"-dummy-pq-padding-len", strconv.Itoa(paddingLen),
+			}
+
+			testCases = append(testCases, testCase{
+				name:         fmt.Sprintf("DummyPQPadding-%d-%s", paddingLen, version.name),
+				testType:     clientTest,
+				tls13Variant: version.tls13Variant,
+				config: Config{
+					MaxVersion: version.version,
+					Bugs: ProtocolBugs{
+						ExpectDummyPQPaddingLength: paddingLen,
+					},
+				},
+				flags: flags,
+			})
+		}
+	}
 }
 
 func addResumptionVersionTests() {

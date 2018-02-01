@@ -265,6 +265,7 @@ type clientHelloMsg struct {
 	supportedCurves         []CurveID
 	supportedPoints         []uint8
 	hasKeyShares            bool
+	keyShareExtension       uint16
 	keyShares               []keyShareEntry
 	trailingKeyShareData    bool
 	pskIdentities           []pskIdentity
@@ -280,6 +281,8 @@ type clientHelloMsg struct {
 	alpnProtocols           []string
 	duplicateExtension      bool
 	channelIDSupported      bool
+	tokenBindingParams      []byte
+	tokenBindingVersion     uint16
 	npnAfterAlpn            bool
 	extendedMasterSecret    bool
 	srtpProtectionProfiles  []uint16
@@ -291,6 +294,7 @@ type clientHelloMsg struct {
 	omitExtensions          bool
 	emptyExtensions         bool
 	pad                     int
+	dummyPQPaddingLen       int
 }
 
 func (m *clientHelloMsg) equal(i interface{}) bool {
@@ -329,6 +333,8 @@ func (m *clientHelloMsg) equal(i interface{}) bool {
 		eqStrings(m.alpnProtocols, m1.alpnProtocols) &&
 		m.duplicateExtension == m1.duplicateExtension &&
 		m.channelIDSupported == m1.channelIDSupported &&
+		bytes.Equal(m.tokenBindingParams, m1.tokenBindingParams) &&
+		m.tokenBindingVersion == m1.tokenBindingVersion &&
 		m.npnAfterAlpn == m1.npnAfterAlpn &&
 		m.extendedMasterSecret == m1.extendedMasterSecret &&
 		eqUint16s(m.srtpProtectionProfiles, m1.srtpProtectionProfiles) &&
@@ -339,7 +345,8 @@ func (m *clientHelloMsg) equal(i interface{}) bool {
 		m.pskBinderFirst == m1.pskBinderFirst &&
 		m.omitExtensions == m1.omitExtensions &&
 		m.emptyExtensions == m1.emptyExtensions &&
-		m.pad == m1.pad
+		m.pad == m1.pad &&
+		m.dummyPQPaddingLen == m1.dummyPQPaddingLen
 }
 
 func (m *clientHelloMsg) marshal() []byte {
@@ -444,7 +451,7 @@ func (m *clientHelloMsg) marshal() []byte {
 		supportedPoints.addBytes(m.supportedPoints)
 	}
 	if m.hasKeyShares {
-		extensions.addU16(extensionKeyShare)
+		extensions.addU16(m.keyShareExtension)
 		keyShareList := extensions.addU16LengthPrefixed()
 
 		keyShares := keyShareList.addU16LengthPrefixed()
@@ -515,6 +522,13 @@ func (m *clientHelloMsg) marshal() []byte {
 	if m.channelIDSupported {
 		extensions.addU16(extensionChannelID)
 		extensions.addU16(0) // Length is always 0
+	}
+	if m.tokenBindingParams != nil {
+		extensions.addU16(extensionTokenBinding)
+		tokbindExtension := extensions.addU16LengthPrefixed()
+		tokbindExtension.addU16(m.tokenBindingVersion)
+		tokbindParams := tokbindExtension.addU8LengthPrefixed()
+		tokbindParams.addBytes(m.tokenBindingParams)
 	}
 	if m.nextProtoNeg && m.npnAfterAlpn {
 		extensions.addU16(extensionNextProtoNeg)
@@ -719,7 +733,12 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			// http://tools.ietf.org/html/rfc5077#section-3.2
 			m.ticketSupported = true
 			m.sessionTicket = []byte(body)
-		case extensionKeyShare:
+		case extensionOldKeyShare, extensionNewKeyShare:
+			// We assume the client only supports one of draft-22 or draft-23.
+			if m.keyShareExtension != 0 {
+				return false
+			}
+			m.keyShareExtension = extension
 			// draft-ietf-tls-tls13 section 6.3.2.3
 			var keyShares byteReader
 			if !body.readU16LengthPrefixed(&keyShares) || len(body) != 0 {
@@ -818,6 +837,12 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 				return false
 			}
 			m.channelIDSupported = true
+		case extensionTokenBinding:
+			if !body.readU16(&m.tokenBindingVersion) ||
+				!body.readU8LengthPrefixedBytes(&m.tokenBindingParams) ||
+				len(body) != 0 {
+				return false
+			}
 		case extensionExtendedMasterSecret:
 			if len(body) != 0 {
 				return false
@@ -847,6 +872,11 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			m.sctListSupported = true
 		case extensionCustom:
 			m.customExtension = string(body)
+		case extensionDummyPQPadding:
+			if len(body) == 0 {
+				return false
+			}
+			m.dummyPQPaddingLen = len(body)
 		}
 
 		if isGREASEValue(extension) {
@@ -912,7 +942,11 @@ func (m *serverHelloMsg) marshal() []byte {
 
 	if vers >= VersionTLS13 {
 		if m.hasKeyShare {
-			extensions.addU16(extensionKeyShare)
+			if isDraft23(m.vers) {
+				extensions.addU16(extensionNewKeyShare)
+			} else {
+				extensions.addU16(extensionOldKeyShare)
+			}
 			keyShare := extensions.addU16LengthPrefixed()
 			keyShare.addU16(uint16(m.keyShare.group))
 			keyExchange := keyShare.addU16LengthPrefixed()
@@ -1015,6 +1049,10 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 	}
 
 	if vers >= VersionTLS13 {
+		extensionKeyShare := extensionOldKeyShare
+		if isDraft23(m.vers) {
+			extensionKeyShare = extensionNewKeyShare
+		}
 		for len(extensions) > 0 {
 			var extension uint16
 			var body byteReader
@@ -1095,6 +1133,8 @@ type serverExtensions struct {
 	alpnProtocolEmpty       bool
 	duplicateExtension      bool
 	channelIDRequested      bool
+	tokenBindingParams      []byte
+	tokenBindingVersion     uint16
 	extendedMasterSecret    bool
 	srtpProtectionProfile   uint16
 	srtpMasterKeyIdentifier string
@@ -1154,6 +1194,13 @@ func (m *serverExtensions) marshal(extensions *byteBuilder) {
 		extensions.addU16(extensionChannelID)
 		extensions.addU16(0)
 	}
+	if m.tokenBindingParams != nil {
+		extensions.addU16(extensionTokenBinding)
+		tokbindExtension := extensions.addU16LengthPrefixed()
+		tokbindExtension.addU16(m.tokenBindingVersion)
+		tokbindParams := tokbindExtension.addU8LengthPrefixed()
+		tokbindParams.addBytes(m.tokenBindingParams)
+	}
 	if m.duplicateExtension {
 		// Add a duplicate bogus extension at the beginning and end.
 		extensions.addU16(0xffff)
@@ -1195,7 +1242,7 @@ func (m *serverExtensions) marshal(extensions *byteBuilder) {
 		}
 	}
 	if m.hasKeyShare {
-		extensions.addU16(extensionKeyShare)
+		extensions.addU16(extensionOldKeyShare)
 		keyShare := extensions.addU16LengthPrefixed()
 		keyShare.addU16(uint16(m.keyShare.group))
 		keyExchange := keyShare.addU16LengthPrefixed()
@@ -1282,6 +1329,13 @@ func (m *serverExtensions) unmarshal(data byteReader, version uint16) bool {
 				return false
 			}
 			m.channelIDRequested = true
+		case extensionTokenBinding:
+			if !body.readU16(&m.tokenBindingVersion) ||
+				!body.readU8LengthPrefixedBytes(&m.tokenBindingParams) ||
+				len(m.tokenBindingParams) != 1 ||
+				len(body) != 0 {
+				return false
+			}
 		case extensionExtendedMasterSecret:
 			if len(body) != 0 {
 				return false
@@ -1388,7 +1442,11 @@ func (m *helloRetryRequestMsg) marshal() []byte {
 			extensions.addU16(m.vers)
 		}
 		if m.hasSelectedGroup {
-			extensions.addU16(extensionKeyShare)
+			if isDraft23(m.vers) {
+				extensions.addU16(extensionNewKeyShare)
+			} else {
+				extensions.addU16(extensionOldKeyShare)
+			}
 			extensions.addU16(2) // length
 			extensions.addU16(uint16(m.selectedGroup))
 		}
@@ -1431,11 +1489,12 @@ func (m *helloRetryRequestMsg) unmarshal(data []byte) bool {
 	if !reader.readU16LengthPrefixed(&extensions) || len(reader) != 0 {
 		return false
 	}
-	for len(extensions) > 0 {
+	extensionsCopy := extensions
+	for len(extensionsCopy) > 0 {
 		var extension uint16
 		var body byteReader
-		if !extensions.readU16(&extension) ||
-			!extensions.readU16LengthPrefixed(&body) {
+		if !extensionsCopy.readU16(&extension) ||
+			!extensionsCopy.readU16LengthPrefixed(&body) {
 			return false
 		}
 		switch extension {
@@ -1445,6 +1504,23 @@ func (m *helloRetryRequestMsg) unmarshal(data []byte) bool {
 				len(body) != 0 {
 				return false
 			}
+		default:
+		}
+	}
+	extensionKeyShare := extensionOldKeyShare
+	if isDraft23(m.vers) {
+		extensionKeyShare = extensionNewKeyShare
+	}
+	for len(extensions) > 0 {
+		var extension uint16
+		var body byteReader
+		if !extensions.readU16(&extension) ||
+			!extensions.readU16LengthPrefixed(&body) {
+			return false
+		}
+		switch extension {
+		case extensionSupportedVersions:
+			// Parsed above.
 		case extensionKeyShare:
 			var v uint16
 			if !body.readU16(&v) || len(body) != 0 {

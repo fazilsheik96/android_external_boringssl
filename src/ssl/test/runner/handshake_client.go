@@ -89,6 +89,8 @@ func (c *Conn) clientHandshake() error {
 		alpnProtocols:           c.config.NextProtos,
 		duplicateExtension:      c.config.Bugs.DuplicateExtension,
 		channelIDSupported:      c.config.ChannelID != nil,
+		tokenBindingParams:      c.config.TokenBindingParams,
+		tokenBindingVersion:     c.config.TokenBindingVersion,
 		npnAfterAlpn:            c.config.Bugs.SwapNPNAndALPN,
 		extendedMasterSecret:    maxVersion >= VersionTLS10,
 		srtpProtectionProfiles:  c.config.SRTPProtectionProfiles,
@@ -159,6 +161,11 @@ func (c *Conn) clientHandshake() error {
 	if maxVersion >= VersionTLS13 {
 		keyShares = make(map[CurveID]ecdhCurve)
 		hello.hasKeyShares = true
+		if c.config.TLS13Variant == TLS13Draft23 {
+			hello.keyShareExtension = extensionNewKeyShare
+		} else {
+			hello.keyShareExtension = extensionOldKeyShare
+		}
 		hello.trailingKeyShareData = c.config.Bugs.TrailingKeyShareData
 		curvesToSend := c.config.defaultCurves()
 		for _, curveID := range hello.supportedCurves {
@@ -1444,6 +1451,29 @@ func (hs *clientHandshakeState) processServerExtensions(serverExtensions *server
 	if !hs.hello.channelIDSupported && serverExtensions.channelIDRequested {
 		c.sendAlert(alertHandshakeFailure)
 		return errors.New("server advertised unrequested Channel ID extension")
+	}
+
+	if len(serverExtensions.tokenBindingParams) == 1 {
+		found := false
+		for _, p := range c.config.TokenBindingParams {
+			if p == serverExtensions.tokenBindingParams[0] {
+				c.tokenBindingParam = p
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("tls: server advertised unsupported Token Binding key param")
+		}
+		if serverExtensions.tokenBindingVersion > c.config.TokenBindingVersion {
+			return errors.New("tls: server's Token Binding version is too new")
+		}
+		if c.vers < VersionTLS13 {
+			if !serverExtensions.extendedMasterSecret || serverExtensions.secureRenegotiation == nil {
+				return errors.New("server sent Token Binding without EMS or RI")
+			}
+		}
+		c.tokenBindingNegotiated = true
 	}
 
 	if serverExtensions.extendedMasterSecret && c.vers >= VersionTLS13 {

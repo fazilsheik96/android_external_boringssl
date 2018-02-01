@@ -1725,6 +1725,18 @@ static bool CheckHandshakeProperties(SSL *ssl, bool is_resume,
     }
   }
 
+  if (config->expected_token_binding_param != -1) {
+    if (!SSL_is_token_binding_negotiated(ssl)) {
+      fprintf(stderr, "no Token Binding negotiated\n");
+      return false;
+    }
+    if (SSL_get_negotiated_token_binding_param(ssl) !=
+        static_cast<uint8_t>(config->expected_token_binding_param)) {
+      fprintf(stderr, "Token Binding param mismatch\n");
+      return false;
+    }
+  }
+
   if (config->expect_extended_master_secret && !SSL_get_extms_support(ssl)) {
     fprintf(stderr, "No EMS for connection when expected\n");
     return false;
@@ -1970,6 +1982,12 @@ static bool DoConnection(bssl::UniquePtr<SSL_SESSION> *out_session,
       }
     }
   }
+  if (!config->send_token_binding_params.empty()) {
+    SSL_set_token_binding_params(ssl.get(),
+                                 reinterpret_cast<const uint8_t *>(
+                                     config->send_token_binding_params.data()),
+                                 config->send_token_binding_params.length());
+  }
   if (!config->host_name.empty() &&
       !SSL_set_tlsext_host_name(ssl.get(), config->host_name.c_str())) {
     return false;
@@ -2053,6 +2071,10 @@ static bool DoConnection(bssl::UniquePtr<SSL_SESSION> *out_session,
   }
   if (config->max_send_fragment > 0) {
     SSL_set_max_send_fragment(ssl.get(), config->max_send_fragment);
+  }
+  if (config->dummy_pq_padding_len > 0 &&
+      !SSL_set_dummy_pq_padding_size(ssl.get(), config->dummy_pq_padding_len)) {
+    return false;
   }
 
   int sock = Connect(config->port);

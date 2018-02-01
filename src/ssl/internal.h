@@ -392,32 +392,17 @@ bool ssl_negotiate_version(SSL_HANDSHAKE *hs, uint8_t *out_alert,
 // call this function before the version is determined.
 uint16_t ssl_protocol_version(const SSL *ssl);
 
-// ssl_is_draft21 returns whether the version corresponds to a draft21 TLS 1.3
-// variant.
-bool ssl_is_draft21(uint16_t version);
-
 // ssl_is_draft22 returns whether the version corresponds to a draft22 TLS 1.3
 // variant.
 bool ssl_is_draft22(uint16_t version);
 
-// ssl_is_resumption_experiment returns whether the version corresponds to a
-// TLS 1.3 resumption experiment.
-bool ssl_is_resumption_experiment(uint16_t version);
+// ssl_is_draft23 returns whether the version corresponds to a draft23 TLS 1.3
+// variant.
+bool ssl_is_draft23(uint16_t version);
 
-// ssl_is_resumption_variant returns whether the variant corresponds to a
-// TLS 1.3 resumption experiment.
-bool ssl_is_resumption_variant(uint16_t max_version,
-                               enum tls13_variant_t variant);
-
-// ssl_is_resumption_client_ccs_experiment returns whether the version
-// corresponds to a TLS 1.3 resumption experiment that sends a client CCS.
-bool ssl_is_resumption_client_ccs_experiment(uint16_t version);
-
-// ssl_is_resumption_record_version_experiment returns whether the version
-// corresponds to a TLS 1.3 resumption experiment that modifies the record
-// version.
-bool ssl_is_resumption_record_version_experiment(uint16_t version);
-
+// ssl_is_draft23_variant returns whether the variant corresponds to a
+// draft23 TLS 1.3 variant.
+ bool ssl_is_draft23_variant(enum tls13_variant_t variant);
 
 // Cipher suites.
 
@@ -1390,6 +1375,12 @@ struct SSL_HANDSHAKE {
 
   // peer_key is the peer's ECDH key for a TLS 1.2 client.
   Array<uint8_t> peer_key;
+
+  // negotiated_token_binding_version is used by a server to store the
+  // on-the-wire encoding of the Token Binding protocol version to advertise in
+  // the ServerHello/EncryptedExtensions if the Token Binding extension is to be
+  // sent.
+  uint16_t negotiated_token_binding_version;
 
   // server_params, in a TLS 1.2 server, stores the ServerKeyExchange
   // parameters. It has client and server randoms prepended for signing
@@ -2596,6 +2587,7 @@ struct SSLConnection {
   uint32_t options;  // protocol behaviour
   uint32_t mode;     // API behaviour
   uint32_t max_cert_list;
+  uint16_t dummy_pq_padding_len;
   char *tlsext_hostname;
   size_t supported_group_list_len;
   uint16_t *supported_group_list;  // our list
@@ -2619,6 +2611,14 @@ struct SSLConnection {
   // format.
   uint8_t *alpn_client_proto_list;
   unsigned alpn_client_proto_list_len;
+
+  // Contains a list of supported Token Binding key parameters.
+  uint8_t *token_binding_params;
+  size_t token_binding_params_len;
+
+  // The negotiated Token Binding key parameter. Only valid if
+  // |token_binding_negotiated| is set.
+  uint8_t negotiated_token_binding_param;
 
   // renegotiate_mode controls how peer renegotiation attempts are handled.
   enum ssl_renegotiate_mode_t renegotiate_mode;
@@ -2646,6 +2646,9 @@ struct SSLConnection {
   // means that we'll accept Channel IDs from clients. For a client, means that
   // we'll advertise support.
   bool tlsext_channel_id_enabled:1;
+
+  // token_binding_negotiated is set if Token Binding was negotiated.
+  bool token_binding_negotiated:1;
 
   // retain_only_sha256_of_client_certs is true if we should compute the SHA256
   // hash of the peer's certificate and then discard it to save memory and

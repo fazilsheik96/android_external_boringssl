@@ -280,6 +280,14 @@ func (hs *serverHandshakeState) readClientHello() error {
 		}
 	}
 
+	// Check that we received the expected version of the key_share extension.
+	if c.vers >= VersionTLS13 {
+		if (isDraft23(c.wireVersion) && hs.clientHello.keyShareExtension != extensionNewKeyShare) ||
+			(!isDraft23(c.wireVersion) && hs.clientHello.keyShareExtension != extensionOldKeyShare) {
+			return fmt.Errorf("tls: client offered wrong key_share extension")
+		}
+	}
+
 	if config.Bugs.ExpectNoTLS12Session {
 		if len(hs.clientHello.sessionId) > 0 && c.vers >= VersionTLS13 {
 			return fmt.Errorf("tls: client offered an unexpected session ID")
@@ -335,6 +343,10 @@ func (hs *serverHandshakeState) readClientHello() error {
 		if !greaseFound && config.Bugs.ExpectGREASE {
 			return errors.New("tls: no GREASE curve value found")
 		}
+	}
+
+	if expected := hs.clientHello.dummyPQPaddingLen; expected != config.Bugs.ExpectDummyPQPaddingLength {
+		return fmt.Errorf("tls: expected dummy PQ padding extension of length %d, but got one of length %d", expected, config.Bugs.ExpectDummyPQPaddingLength)
 	}
 
 	applyBugsToClientHello(hs.clientHello, config)
@@ -1367,6 +1379,21 @@ func (hs *serverHandshakeState) processClientExtensions(serverExtensions *server
 
 	if hs.clientHello.channelIDSupported && config.RequestChannelID {
 		serverExtensions.channelIDRequested = true
+	}
+
+	if config.TokenBindingParams != nil {
+		if !bytes.Equal(config.ExpectTokenBindingParams, hs.clientHello.tokenBindingParams) {
+			return errors.New("client did not send expected token binding params")
+		}
+
+		// For testing, blindly send whatever is set in config, even if
+		// it is invalid.
+		serverExtensions.tokenBindingParams = config.TokenBindingParams
+		serverExtensions.tokenBindingVersion = config.TokenBindingVersion
+	}
+
+	if len(hs.clientHello.tokenBindingParams) > 0 && (!hs.clientHello.extendedMasterSecret || hs.clientHello.secureRenegotiation == nil) {
+		return errors.New("client sent Token Binding without EMS and/or RI")
 	}
 
 	if hs.clientHello.srtpProtectionProfiles != nil {

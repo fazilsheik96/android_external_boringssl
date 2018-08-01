@@ -535,6 +535,7 @@ OPENSSL_EXPORT int SSL_get_error(const SSL *ssl, int ret_code);
 #define SSL_ERROR_WANT_CERTIFICATE_VERIFY 16
 
 #define SSL_ERROR_HANDOFF 17
+#define SSL_ERROR_HANDBACK 18
 
 // SSL_set_mtu sets the |ssl|'s MTU in DTLS to |mtu|. It returns one on success
 // and zero on failure.
@@ -596,6 +597,7 @@ OPENSSL_EXPORT int DTLSv1_handle_timeout(SSL *ssl);
 #define DTLS1_2_VERSION 0xfefd
 
 #define TLS1_3_DRAFT23_VERSION 0x7f17
+#define TLS1_3_DRAFT28_VERSION 0x7f1c
 
 // SSL_CTX_set_min_proto_version sets the minimum protocol version for |ctx| to
 // |version|. If |version| is zero, the default minimum version is used. It
@@ -968,9 +970,9 @@ OPENSSL_EXPORT int SSL_set_ocsp_response(SSL *ssl,
 #define SSL_SIGN_ECDSA_SECP256R1_SHA256 0x0403
 #define SSL_SIGN_ECDSA_SECP384R1_SHA384 0x0503
 #define SSL_SIGN_ECDSA_SECP521R1_SHA512 0x0603
-#define SSL_SIGN_RSA_PSS_SHA256 0x0804
-#define SSL_SIGN_RSA_PSS_SHA384 0x0805
-#define SSL_SIGN_RSA_PSS_SHA512 0x0806
+#define SSL_SIGN_RSA_PSS_RSAE_SHA256 0x0804
+#define SSL_SIGN_RSA_PSS_RSAE_SHA384 0x0805
+#define SSL_SIGN_RSA_PSS_RSAE_SHA512 0x0806
 #define SSL_SIGN_ED25519 0x0807
 
 // SSL_SIGN_RSA_PKCS1_MD5_SHA1 is an internal signature algorithm used to
@@ -1692,6 +1694,13 @@ OPENSSL_EXPORT uint32_t SSL_SESSION_get_timeout(const SSL_SESSION *session);
 // TODO(davidben): This should return a const X509 *.
 OPENSSL_EXPORT X509 *SSL_SESSION_get0_peer(const SSL_SESSION *session);
 
+// SSL_SESSION_get0_peer_certificates returns the peer certificate chain stored
+// in |session|, or NULL if the peer did not use certificates. This is the
+// unverified list of certificates as sent by the peer, not the final chain
+// built during verification. The caller does not take ownership of the result.
+OPENSSL_EXPORT const STACK_OF(CRYPTO_BUFFER) *
+    SSL_SESSION_get0_peer_certificates(const SSL_SESSION *session);
+
 // SSL_SESSION_get_master_key writes up to |max_out| bytes of |session|'s master
 // secret to |out| and returns the number of bytes written. If |max_out| is
 // zero, it returns the size of the master secret.
@@ -1746,6 +1755,15 @@ OPENSSL_EXPORT void SSL_SESSION_get0_ticket(const SSL_SESSION *session,
 // |session| in seconds or zero if none was set.
 OPENSSL_EXPORT uint32_t
 SSL_SESSION_get_ticket_lifetime_hint(const SSL_SESSION *session);
+
+// SSL_SESSION_get0_cipher returns the cipher negotiated by the connection which
+// established |session|.
+//
+// Note that, in TLS 1.3, there is no guarantee that resumptions with |session|
+// will use that cipher. Prefer calling |SSL_get_current_cipher| on the |SSL|
+// instead.
+OPENSSL_EXPORT const SSL_CIPHER *SSL_SESSION_get0_cipher(
+    const SSL_SESSION *session);
 
 
 // Session caching.
@@ -2456,10 +2474,19 @@ OPENSSL_EXPORT int SSL_set0_verify_cert_store(SSL *ssl, X509_STORE *store);
 OPENSSL_EXPORT int SSL_set1_verify_cert_store(SSL *ssl, X509_STORE *store);
 
 // SSL_CTX_set_ed25519_enabled configures whether |ctx| advertises support for
-// the Ed25519 signature algorithm when using the default preference list.
+// the Ed25519 signature algorithm when using the default preference list. It is
+// disabled by default and may be enabled if the certificate verifier supports
+// Ed25519.
 OPENSSL_EXPORT void SSL_CTX_set_ed25519_enabled(SSL_CTX *ctx, int enabled);
 
-// SSL_CTX_set_verify_algorithm_prefs confingures |ctx| to use |prefs| as the
+// SSL_CTX_set_rsa_pss_rsae_certs_enabled configures whether |ctx| advertises
+// support for rsa_pss_rsae_* signatures within the certificate chain. It is
+// enabled by default but should be disabled if using a custom certificate
+// verifier which does not support RSA-PSS signatures.
+OPENSSL_EXPORT void SSL_CTX_set_rsa_pss_rsae_certs_enabled(SSL_CTX *ctx,
+                                                           int enabled);
+
+// SSL_CTX_set_verify_algorithm_prefs configures |ctx| to use |prefs| as the
 // preference list when verifying signature's from the peer's long-term key. It
 // returns one on zero on error. |prefs| should not include the internal-only
 // value |SSL_SIGN_RSA_PKCS1_MD5_SHA1|.
@@ -2952,6 +2979,11 @@ OPENSSL_EXPORT const char *SSL_get_psk_identity(const SSL *ssl);
 // phase of the experiment. It returns one for success and zero otherwise.
 OPENSSL_EXPORT int SSL_set_dummy_pq_padding_size(SSL *ssl, size_t num_bytes);
 
+// SSL_dummy_pq_padding_used returns one if the server echoed a dummy PQ padding
+// extension and zero otherwise. It may only be called on a client connection
+// once the ServerHello has been processed, otherwise it'll return zero.
+OPENSSL_EXPORT int SSL_dummy_pq_padding_used(SSL *ssl);
+
 
 // QUIC Transport Parameters.
 //
@@ -3304,6 +3336,7 @@ OPENSSL_EXPORT int SSL_total_renegotiations(const SSL *ssl);
 
 enum tls13_variant_t {
   tls13_default = 0,
+  tls13_draft28 = 1,
 };
 
 // SSL_CTX_set_tls13_variant sets which variant of TLS 1.3 we negotiate. On the
@@ -3595,6 +3628,7 @@ OPENSSL_EXPORT const char *SSL_CIPHER_get_version(const SSL_CIPHER *cipher);
 OPENSSL_EXPORT char *SSL_CIPHER_get_rfc_name(const SSL_CIPHER *cipher);
 
 typedef void COMP_METHOD;
+typedef struct ssl_comp_st SSL_COMP;
 
 // SSL_COMP_get_compression_methods returns NULL.
 OPENSSL_EXPORT STACK_OF(SSL_COMP) *SSL_COMP_get_compression_methods(void);
@@ -3604,6 +3638,12 @@ OPENSSL_EXPORT int SSL_COMP_add_compression_method(int id, COMP_METHOD *cm);
 
 // SSL_COMP_get_name returns NULL.
 OPENSSL_EXPORT const char *SSL_COMP_get_name(const COMP_METHOD *comp);
+
+// SSL_COMP_get0_name returns the |name| member of |comp|.
+OPENSSL_EXPORT const char *SSL_COMP_get0_name(const SSL_COMP *comp);
+
+// SSL_COMP_get_id returns the |id| member of |comp|.
+OPENSSL_EXPORT int SSL_COMP_get_id(const SSL_COMP *comp);
 
 // SSL_COMP_free_compression_methods does nothing.
 OPENSSL_EXPORT void SSL_COMP_free_compression_methods(void);
@@ -3621,17 +3661,12 @@ OPENSSL_EXPORT const SSL_METHOD *TLSv1_2_method(void);
 OPENSSL_EXPORT const SSL_METHOD *DTLSv1_method(void);
 OPENSSL_EXPORT const SSL_METHOD *DTLSv1_2_method(void);
 
-// SSLv3_method returns an |SSL_METHOD| with no versions enabled.
-OPENSSL_EXPORT const SSL_METHOD *SSLv3_method(void);
-
 // These client- and server-specific methods call their corresponding generic
 // methods.
 OPENSSL_EXPORT const SSL_METHOD *TLS_server_method(void);
 OPENSSL_EXPORT const SSL_METHOD *TLS_client_method(void);
 OPENSSL_EXPORT const SSL_METHOD *SSLv23_server_method(void);
 OPENSSL_EXPORT const SSL_METHOD *SSLv23_client_method(void);
-OPENSSL_EXPORT const SSL_METHOD *SSLv3_server_method(void);
-OPENSSL_EXPORT const SSL_METHOD *SSLv3_client_method(void);
 OPENSSL_EXPORT const SSL_METHOD *TLSv1_server_method(void);
 OPENSSL_EXPORT const SSL_METHOD *TLSv1_client_method(void);
 OPENSSL_EXPORT const SSL_METHOD *TLSv1_1_server_method(void);
@@ -3836,8 +3871,6 @@ OPENSSL_EXPORT void SSL_set_tmp_dh_callback(SSL *ssl,
 #define SSL_set_timeout(session, timeout) \
     SSL_SESSION_set_timeout((session), (timeout))
 
-typedef struct ssl_comp_st SSL_COMP;
-
 struct ssl_comp_st {
   int id;
   const char *name;
@@ -3921,6 +3954,7 @@ OPENSSL_EXPORT void SSL_CTX_set_client_cert_cb(
 #define SSL_EARLY_DATA_REJECTED 11
 #define SSL_CERTIFICATE_VERIFY 12
 #define SSL_HANDOFF 13
+#define SSL_HANDBACK 14
 
 // SSL_want returns one of the above values to determine what the most recent
 // operation on |ssl| was blocked on. Use |SSL_get_error| instead.
@@ -4098,15 +4132,11 @@ OPENSSL_EXPORT SSL_SESSION *SSL_get1_session(SSL *ssl);
 OPENSSL_EXPORT int OPENSSL_init_ssl(uint64_t opts,
                                     const OPENSSL_INIT_SETTINGS *settings);
 
-#if !defined(BORINGSSL_NO_CXX)
-// SSL_CTX_sess_set_get_cb is a legacy C++ overload of |SSL_CTX_sess_set_get_cb|
-// which supports the old callback signature.
-//
-// TODO(davidben): Remove this once Node is compatible with OpenSSL 1.1.0.
-extern "C++" OPENSSL_EXPORT void SSL_CTX_sess_set_get_cb(
-    SSL_CTX *ctx, SSL_SESSION *(*get_session_cb)(SSL *ssl, uint8_t *id,
-                                                 int id_len, int *out_copy));
-#endif
+// The following constants are legacy aliases for RSA-PSS with rsaEncryption
+// keys. Use the new names instead.
+#define SSL_SIGN_RSA_PSS_SHA256 SSL_SIGN_RSA_PSS_RSAE_SHA256
+#define SSL_SIGN_RSA_PSS_SHA384 SSL_SIGN_RSA_PSS_RSAE_SHA384
+#define SSL_SIGN_RSA_PSS_SHA512 SSL_SIGN_RSA_PSS_RSAE_SHA512
 
 
 // Private structures.
@@ -4473,10 +4503,10 @@ OPENSSL_EXPORT bool SealRecord(SSL *ssl, Span<uint8_t> out_prefix,
 // state of the connection.
 //
 // Elsewhere, a fresh |SSL| can be used with |SSL_apply_handoff| to continue
-// the connection. The connection from the client is fed into this |SSL| until
-// the handshake completes normally. At this point (and only at this point),
-// |SSL_serialize_handback| can be called to serialize the result of the
-// handshake.
+// the connection. The connection from the client is fed into this |SSL|, and
+// the handshake resumed. When the handshake stops again and |SSL_get_error|
+// indicates |SSL_ERROR_HANDBACK|, |SSL_serialize_handback| should be called to
+// serialize the state of the handshake again.
 //
 // Back at the first location, a fresh |SSL| can be used with
 // |SSL_apply_handback|. Then the client's connection can be processed mostly
@@ -4484,7 +4514,7 @@ OPENSSL_EXPORT bool SealRecord(SSL *ssl, Span<uint8_t> out_prefix,
 //
 // Lastly, when a connection is in the handoff state, whether or not
 // |SSL_serialize_handoff| is called, |SSL_decline_handoff| will move it back
-// into a normal state where the connection can procede without impact.
+// into a normal state where the connection can proceed without impact.
 //
 // WARNING: Currently only works with TLS 1.0–1.2.
 // WARNING: The serialisation formats are not yet stable: version skew may be

@@ -3447,9 +3447,11 @@ static void ConnectClientAndServerWithTicketMethod(
   }
 }
 
+using TicketAEADMethodParam =
+    testing::tuple<uint16_t, unsigned, ssl_test_ticket_aead_failure_mode>;
+
 class TicketAEADMethodTest
-    : public ::testing::TestWithParam<testing::tuple<
-          uint16_t, unsigned, ssl_test_ticket_aead_failure_mode>> {};
+    : public ::testing::TestWithParam<TicketAEADMethodParam> {};
 
 TEST_P(TicketAEADMethodTest, Resume) {
   bssl::UniquePtr<X509> cert = GetTestCertificate();
@@ -3525,49 +3527,49 @@ TEST_P(TicketAEADMethodTest, Resume) {
   }
 }
 
+std::string TicketAEADMethodParamToString(
+    const testing::TestParamInfo<TicketAEADMethodParam> &params) {
+  std::string ret = GetVersionName(std::get<0>(params.param));
+  // GTest only allows alphanumeric characters and '_' in the parameter
+  // string. Additionally filter out the 'v' to get "TLS13" over "TLSv13".
+  for (auto it = ret.begin(); it != ret.end();) {
+    if (*it == '.' || *it == 'v') {
+      it = ret.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  char retry_count[256];
+  snprintf(retry_count, sizeof(retry_count), "%d", std::get<1>(params.param));
+  ret += "_";
+  ret += retry_count;
+  ret += "Retries_";
+  switch (std::get<2>(params.param)) {
+    case ssl_test_ticket_aead_ok:
+      ret += "OK";
+      break;
+    case ssl_test_ticket_aead_seal_fail:
+      ret += "SealFail";
+      break;
+    case ssl_test_ticket_aead_open_soft_fail:
+      ret += "OpenSoftFail";
+      break;
+    case ssl_test_ticket_aead_open_hard_fail:
+      ret += "OpenHardFail";
+      break;
+  }
+  return ret;
+}
+
 INSTANTIATE_TEST_CASE_P(
     TicketAEADMethodTests, TicketAEADMethodTest,
-    testing::Combine(
-        testing::Values(TLS1_2_VERSION, TLS1_3_VERSION),
-        testing::Values(0, 1, 2),
-        testing::Values(ssl_test_ticket_aead_ok,
-                        ssl_test_ticket_aead_seal_fail,
-                        ssl_test_ticket_aead_open_soft_fail,
-                        ssl_test_ticket_aead_open_hard_fail)));
-
-TEST(SSLTest, SSL3Method) {
-  bssl::UniquePtr<X509> cert = GetTestCertificate();
-  ASSERT_TRUE(cert);
-
-  // For compatibility, SSLv3_method should work up to SSL_CTX_new and SSL_new.
-  bssl::UniquePtr<SSL_CTX> ssl3_ctx(SSL_CTX_new(SSLv3_method()));
-  ASSERT_TRUE(ssl3_ctx);
-  ASSERT_TRUE(SSL_CTX_use_certificate(ssl3_ctx.get(), cert.get()));
-  bssl::UniquePtr<SSL> ssl(SSL_new(ssl3_ctx.get()));
-  EXPECT_TRUE(ssl);
-
-  // Create a normal TLS context to test against.
-  bssl::UniquePtr<SSL_CTX> tls_ctx(SSL_CTX_new(TLS_method()));
-  ASSERT_TRUE(tls_ctx);
-  ASSERT_TRUE(SSL_CTX_use_certificate(tls_ctx.get(), cert.get()));
-
-  // However, handshaking an SSLv3_method server should fail to resolve the
-  // version range. Explicit calls to SSL_CTX_set_min_proto_version are the only
-  // way to enable SSL 3.0.
-  bssl::UniquePtr<SSL> client, server;
-  EXPECT_FALSE(ConnectClientAndServer(&client, &server, tls_ctx.get(),
-                                      ssl3_ctx.get()));
-  uint32_t err = ERR_get_error();
-  EXPECT_EQ(ERR_LIB_SSL, ERR_GET_LIB(err));
-  EXPECT_EQ(SSL_R_NO_SUPPORTED_VERSIONS_ENABLED, ERR_GET_REASON(err));
-
-  // Likewise for SSLv3_method clients.
-  EXPECT_FALSE(ConnectClientAndServer(&client, &server, ssl3_ctx.get(),
-                                      tls_ctx.get()));
-  err = ERR_get_error();
-  EXPECT_EQ(ERR_LIB_SSL, ERR_GET_LIB(err));
-  EXPECT_EQ(SSL_R_NO_SUPPORTED_VERSIONS_ENABLED, ERR_GET_REASON(err));
-}
+    testing::Combine(testing::Values(TLS1_2_VERSION, TLS1_3_VERSION),
+                     testing::Values(0, 1, 2),
+                     testing::Values(ssl_test_ticket_aead_ok,
+                                     ssl_test_ticket_aead_seal_fail,
+                                     ssl_test_ticket_aead_open_soft_fail,
+                                     ssl_test_ticket_aead_open_hard_fail)),
+    TicketAEADMethodParamToString);
 
 TEST(SSLTest, SelectNextProto) {
   uint8_t *result;
@@ -3918,10 +3920,10 @@ TEST(SSLTest, SignatureAlgorithmProperties) {
       SSL_is_signature_algorithm_rsa_pss(SSL_SIGN_ECDSA_SECP256R1_SHA256));
 
   EXPECT_EQ(EVP_PKEY_RSA,
-            SSL_get_signature_algorithm_key_type(SSL_SIGN_RSA_PSS_SHA384));
+            SSL_get_signature_algorithm_key_type(SSL_SIGN_RSA_PSS_RSAE_SHA384));
   EXPECT_EQ(EVP_sha384(),
-            SSL_get_signature_algorithm_digest(SSL_SIGN_RSA_PSS_SHA384));
-  EXPECT_TRUE(SSL_is_signature_algorithm_rsa_pss(SSL_SIGN_RSA_PSS_SHA384));
+            SSL_get_signature_algorithm_digest(SSL_SIGN_RSA_PSS_RSAE_SHA384));
+  EXPECT_TRUE(SSL_is_signature_algorithm_rsa_pss(SSL_SIGN_RSA_PSS_RSAE_SHA384));
 }
 
 void MoveBIOs(SSL *dest, SSL *src) {
@@ -3983,9 +3985,13 @@ TEST(SSLTest, Handoff) {
 
   int handshake_ret = SSL_do_handshake(handshaker.get());
   int handshake_err = SSL_get_error(handshaker.get(), handshake_ret);
-  ASSERT_EQ(handshake_err, SSL_ERROR_WANT_READ);
+  ASSERT_EQ(handshake_err, SSL_ERROR_HANDBACK);
 
-  ASSERT_TRUE(CompleteHandshakes(client.get(), handshaker.get()));
+  // Double-check that additional calls to |SSL_do_handshake| continue
+  // to get |SSL_ERRROR_HANDBACK|.
+  handshake_ret = SSL_do_handshake(handshaker.get());
+  handshake_err = SSL_get_error(handshaker.get(), handshake_ret);
+  ASSERT_EQ(handshake_err, SSL_ERROR_HANDBACK);
 
   ScopedCBB cbb_handback;
   Array<uint8_t> handback;
@@ -3997,6 +4003,7 @@ TEST(SSLTest, Handoff) {
   ASSERT_TRUE(SSL_apply_handback(server2.get(), handback));
 
   MoveBIOs(server2.get(), handshaker.get());
+  ASSERT_TRUE(CompleteHandshakes(client.get(), server2.get()));
 
   uint8_t byte = 42;
   EXPECT_EQ(SSL_write(client.get(), &byte, 1), 1);

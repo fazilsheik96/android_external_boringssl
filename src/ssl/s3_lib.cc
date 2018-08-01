@@ -177,7 +177,8 @@ SSL3_STATE::SSL3_STATE()
       key_update_pending(false),
       wpend_pending(false),
       early_data_accepted(false),
-      draft_downgrade(false) {}
+      draft_downgrade(false),
+      token_binding_negotiated(false) {}
 
 SSL3_STATE::~SSL3_STATE() {}
 
@@ -214,8 +215,7 @@ void ssl3_free(SSL *ssl) {
   ssl->s3 = NULL;
 }
 
-const struct ssl_cipher_preference_list_st *ssl_get_cipher_preferences(
-    const SSL *ssl) {
+const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl) {
   if (ssl->cipher_list != NULL) {
     return ssl->cipher_list;
   }

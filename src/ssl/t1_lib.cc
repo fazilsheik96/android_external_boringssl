@@ -4,21 +4,21 @@
  * This package is an SSL implementation written
  * by Eric Young (eay@cryptsoft.com).
  * The implementation was written so as to conform with Netscapes SSL.
- * 
+ *
  * This library is free for commercial and non-commercial use as long as
  * the following conditions are aheared to.  The following conditions
  * apply to all code found in this distribution, be it the RC4, RSA,
  * lhash, DES, etc., code; not just the SSL code.  The SSL documentation
  * included with this distribution is covered by the same copyright terms
  * except that the holder is Tim Hudson (tjh@cryptsoft.com).
- * 
+ *
  * Copyright remains Eric Young's, and as such any Copyright notices in
  * the code are not to be removed.
  * If this package is used in a product, Eric Young should be given attribution
  * as the author of the parts of the library used.
  * This can be in the form of a textual message at program startup or
  * in documentation (online or textual) provided with the package.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -33,10 +33,10 @@
  *     Eric Young (eay@cryptsoft.com)"
  *    The word 'cryptographic' can be left out if the rouines from the library
  *    being used are not cryptographic related :-).
- * 4. If you include any Windows specific code (or a derivative thereof) from 
+ * 4. If you include any Windows specific code (or a derivative thereof) from
  *    the apps directory (application code) you must include an acknowledgement:
  *    "This product includes software written by Tim Hudson (tjh@cryptsoft.com)"
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY ERIC YOUNG ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -48,7 +48,7 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * The licence and distribution terms for any publically available version or
  * derivative of this code cannot be changed.  i.e. this code cannot simply be
  * copied and put under another distribution licence
@@ -62,7 +62,7 @@
  * are met:
  *
  * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer. 
+ *    notice, this list of conditions and the following disclaimer.
  *
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in
@@ -419,15 +419,15 @@ static const uint16_t kVerifySignatureAlgorithms[] = {
     // List our preferred algorithms first.
     SSL_SIGN_ED25519,
     SSL_SIGN_ECDSA_SECP256R1_SHA256,
-    SSL_SIGN_RSA_PSS_SHA256,
+    SSL_SIGN_RSA_PSS_RSAE_SHA256,
     SSL_SIGN_RSA_PKCS1_SHA256,
 
     // Larger hashes are acceptable.
     SSL_SIGN_ECDSA_SECP384R1_SHA384,
-    SSL_SIGN_RSA_PSS_SHA384,
+    SSL_SIGN_RSA_PSS_RSAE_SHA384,
     SSL_SIGN_RSA_PKCS1_SHA384,
 
-    SSL_SIGN_RSA_PSS_SHA512,
+    SSL_SIGN_RSA_PSS_RSAE_SHA512,
     SSL_SIGN_RSA_PKCS1_SHA512,
 
     // For now, SHA-1 is still accepted but least preferable.
@@ -445,18 +445,18 @@ static const uint16_t kSignSignatureAlgorithms[] = {
     // List our preferred algorithms first.
     SSL_SIGN_ED25519,
     SSL_SIGN_ECDSA_SECP256R1_SHA256,
-    SSL_SIGN_RSA_PSS_SHA256,
+    SSL_SIGN_RSA_PSS_RSAE_SHA256,
     SSL_SIGN_RSA_PKCS1_SHA256,
 
     // If needed, sign larger hashes.
     //
     // TODO(davidben): Determine which of these may be pruned.
     SSL_SIGN_ECDSA_SECP384R1_SHA384,
-    SSL_SIGN_RSA_PSS_SHA384,
+    SSL_SIGN_RSA_PSS_RSAE_SHA384,
     SSL_SIGN_RSA_PKCS1_SHA384,
 
     SSL_SIGN_ECDSA_SECP521R1_SHA512,
-    SSL_SIGN_RSA_PSS_SHA512,
+    SSL_SIGN_RSA_PSS_RSAE_SHA512,
     SSL_SIGN_RSA_PKCS1_SHA512,
 
     // If the peer supports nothing else, sign with SHA-1.
@@ -464,44 +464,78 @@ static const uint16_t kSignSignatureAlgorithms[] = {
     SSL_SIGN_RSA_PKCS1_SHA1,
 };
 
-bool tls12_add_verify_sigalgs(const SSL *ssl, CBB *out) {
-  bool use_default = ssl->ctx->num_verify_sigalgs == 0;
-  Span<const uint16_t> sigalgs = kVerifySignatureAlgorithms;
-  if (!use_default) {
-    sigalgs = MakeConstSpan(ssl->ctx->verify_sigalgs,
-                            ssl->ctx->num_verify_sigalgs);
+struct SSLSignatureAlgorithmList {
+  bool Next(uint16_t *out) {
+    while (!list.empty()) {
+      uint16_t sigalg = list[0];
+      list = list.subspan(1);
+      if (skip_ed25519 && sigalg == SSL_SIGN_ED25519) {
+        continue;
+      }
+      if (skip_rsa_pss_rsae && SSL_is_signature_algorithm_rsa_pss(sigalg)) {
+        continue;
+      }
+      *out = sigalg;
+      return true;
+    }
+    return false;
   }
 
-  for (uint16_t sigalg : sigalgs) {
-    if (use_default &&
-        sigalg == SSL_SIGN_ED25519 &&
-        !ssl->ctx->ed25519_enabled) {
-      continue;
+  bool operator==(const SSLSignatureAlgorithmList &other) const {
+    SSLSignatureAlgorithmList a = *this;
+    SSLSignatureAlgorithmList b = other;
+    uint16_t a_val, b_val;
+    while (a.Next(&a_val)) {
+      if (!b.Next(&b_val) ||
+          a_val != b_val) {
+        return false;
+      }
     }
+    return !b.Next(&b_val);
+  }
+
+  bool operator!=(const SSLSignatureAlgorithmList &other) const {
+    return !(*this == other);
+  }
+
+  Span<const uint16_t> list;
+  bool skip_ed25519 = false;
+  bool skip_rsa_pss_rsae = false;
+};
+
+static SSLSignatureAlgorithmList tls12_get_verify_sigalgs(const SSL *ssl,
+                                                          bool for_certs) {
+  SSLSignatureAlgorithmList ret;
+  if (ssl->ctx->num_verify_sigalgs != 0) {
+    ret.list =
+        MakeConstSpan(ssl->ctx->verify_sigalgs, ssl->ctx->num_verify_sigalgs);
+  } else {
+    ret.list = kVerifySignatureAlgorithms;
+    ret.skip_ed25519 = !ssl->ctx->ed25519_enabled;
+  }
+  if (for_certs) {
+    ret.skip_rsa_pss_rsae = !ssl->ctx->rsa_pss_rsae_certs_enabled;
+  }
+  return ret;
+}
+
+bool tls12_add_verify_sigalgs(const SSL *ssl, CBB *out, bool for_certs) {
+  SSLSignatureAlgorithmList list = tls12_get_verify_sigalgs(ssl, for_certs);
+  uint16_t sigalg;
+  while (list.Next(&sigalg)) {
     if (!CBB_add_u16(out, sigalg)) {
       return false;
     }
   }
-
   return true;
 }
 
 bool tls12_check_peer_sigalg(const SSL *ssl, uint8_t *out_alert,
                              uint16_t sigalg) {
-  const uint16_t *sigalgs = kVerifySignatureAlgorithms;
-  size_t num_sigalgs = OPENSSL_ARRAY_SIZE(kVerifySignatureAlgorithms);
-  if (ssl->ctx->num_verify_sigalgs != 0) {
-    sigalgs = ssl->ctx->verify_sigalgs;
-    num_sigalgs = ssl->ctx->num_verify_sigalgs;
-  }
-
-  for (size_t i = 0; i < num_sigalgs; i++) {
-    if (sigalgs == kVerifySignatureAlgorithms &&
-        sigalgs[i] == SSL_SIGN_ED25519 &&
-        !ssl->ctx->ed25519_enabled) {
-      continue;
-    }
-    if (sigalg == sigalgs[i]) {
+  SSLSignatureAlgorithmList list = tls12_get_verify_sigalgs(ssl, false);
+  uint16_t verify_sigalg;
+  while (list.Next(&verify_sigalg)) {
+    if (verify_sigalg == sigalg) {
       return true;
     }
   }
@@ -509,6 +543,11 @@ bool tls12_check_peer_sigalg(const SSL *ssl, uint8_t *out_alert,
   OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
   *out_alert = SSL_AD_ILLEGAL_PARAMETER;
   return false;
+}
+
+bool tls12_has_different_verify_sigalgs_for_certs(const SSL *ssl) {
+  return tls12_get_verify_sigalgs(ssl, true) !=
+         tls12_get_verify_sigalgs(ssl, false);
 }
 
 // tls_extension represents a TLS extension that is handled internally. The
@@ -554,11 +593,6 @@ static bool forbid_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
 static bool ignore_parse_clienthello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
                                     CBS *contents) {
   // This extension from the client is handled elsewhere.
-  return true;
-}
-
-static bool ignore_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
-                                     CBS *contents) {
   return true;
 }
 
@@ -990,11 +1024,23 @@ static bool ext_sigalgs_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
     return true;
   }
 
+  // Prior to TLS 1.3, there was no way to signal different signature algorithm
+  // preferences between the online signature and certificates. If we do not
+  // send the signature_algorithms_cert extension, use the potentially more
+  // restrictive certificate list.
+  //
+  // TODO(davidben): When TLS 1.3 is finalized, we can likely remove the TLS 1.3
+  // check both here and in signature_algorithms_cert. |hs->max_version| is not
+  // the negotiated version. Rather the expectation is that any server consuming
+  // signature algorithms added in TLS 1.3 will also know to look at
+  // signature_algorithms_cert. For now, TLS 1.3 is not quite yet final and it
+  // seems prudent to condition this new extension on it.
+  bool for_certs = hs->max_version < TLS1_3_VERSION;
   CBB contents, sigalgs_cbb;
   if (!CBB_add_u16(out, TLSEXT_TYPE_signature_algorithms) ||
       !CBB_add_u16_length_prefixed(out, &contents) ||
       !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb) ||
-      !tls12_add_verify_sigalgs(ssl, &sigalgs_cbb) ||
+      !tls12_add_verify_sigalgs(ssl, &sigalgs_cbb, for_certs) ||
       !CBB_flush(out)) {
     return false;
   }
@@ -1014,6 +1060,35 @@ static bool ext_sigalgs_parse_clienthello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
       CBS_len(contents) != 0 ||
       CBS_len(&supported_signature_algorithms) == 0 ||
       !tls1_parse_peer_sigalgs(hs, &supported_signature_algorithms)) {
+    return false;
+  }
+
+  return true;
+}
+
+
+// Signature Algorithms for Certificates.
+//
+// https://tools.ietf.org/html/draft-ietf-tls-tls13-23#section-4.2.3
+
+static bool ext_sigalgs_cert_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
+  SSL *const ssl = hs->ssl;
+  // If this extension is omitted, it defaults to the signature_algorithms
+  // extension, so only emit it if the list is different.
+  //
+  // This extension is also new in TLS 1.3, so omit it if TLS 1.3 is disabled.
+  // There is a corresponding version check in |ext_sigalgs_add_clienthello|.
+  if (hs->max_version < TLS1_3_VERSION ||
+      !tls12_has_different_verify_sigalgs_for_certs(ssl)) {
+    return true;
+  }
+
+  CBB contents, sigalgs_cbb;
+  if (!CBB_add_u16(out, TLSEXT_TYPE_signature_algorithms_cert) ||
+      !CBB_add_u16_length_prefixed(out, &contents) ||
+      !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb) ||
+      !tls12_add_verify_sigalgs(ssl, &sigalgs_cbb, true /* certs */) ||
+      !CBB_flush(out)) {
     return false;
   }
 
@@ -1314,8 +1389,8 @@ static bool ext_sct_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
          CBB_add_u16_length_prefixed(out, &contents) &&
          CBB_add_bytes(
              &contents,
-             CRYPTO_BUFFER_data(ssl->cert->signed_cert_timestamp_list),
-             CRYPTO_BUFFER_len(ssl->cert->signed_cert_timestamp_list)) &&
+             CRYPTO_BUFFER_data(ssl->cert->signed_cert_timestamp_list.get()),
+             CRYPTO_BUFFER_len(ssl->cert->signed_cert_timestamp_list.get())) &&
          CBB_flush(out);
 }
 
@@ -1571,7 +1646,7 @@ static bool ext_channel_id_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
 
 
 static void ext_srtp_init(SSL_HANDSHAKE *hs) {
-  hs->ssl->srtp_profile = NULL;
+  hs->ssl->s3->srtp_profile = NULL;
 }
 
 static bool ext_srtp_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
@@ -1638,7 +1713,7 @@ static bool ext_srtp_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
   // offered).
   for (const SRTP_PROTECTION_PROFILE *profile : profiles) {
     if (profile->id == profile_id) {
-      ssl->srtp_profile = profile;
+      ssl->s3->srtp_profile = profile;
       return true;
     }
   }
@@ -1680,7 +1755,7 @@ static bool ext_srtp_parse_clienthello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
       }
 
       if (server_profile->id == profile_id) {
-        ssl->srtp_profile = server_profile;
+        ssl->s3->srtp_profile = server_profile;
         return true;
       }
     }
@@ -1691,7 +1766,7 @@ static bool ext_srtp_parse_clienthello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
 
 static bool ext_srtp_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
   SSL *const ssl = hs->ssl;
-  if (ssl->srtp_profile == NULL) {
+  if (ssl->s3->srtp_profile == NULL) {
     return true;
   }
 
@@ -1699,7 +1774,7 @@ static bool ext_srtp_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
   if (!CBB_add_u16(out, TLSEXT_TYPE_srtp) ||
       !CBB_add_u16_length_prefixed(out, &contents) ||
       !CBB_add_u16_length_prefixed(&contents, &profile_ids) ||
-      !CBB_add_u16(&profile_ids, ssl->srtp_profile->id) ||
+      !CBB_add_u16(&profile_ids, ssl->s3->srtp_profile->id) ||
       !CBB_add_u8(&contents, 0 /* empty MKI */) ||
       !CBB_flush(out)) {
     return false;
@@ -2324,12 +2399,7 @@ static bool ext_cookie_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
 // key-exchange and so enable measurement of the latency impact of the
 // additional bandwidth.
 
-static bool ext_dummy_pq_padding_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
-  const size_t len = hs->ssl->dummy_pq_padding_len;
-  if (len == 0) {
-    return true;
-  }
-
+static bool ext_dummy_pq_padding_add(CBB *out, size_t len) {
   CBB contents;
   uint8_t *buffer;
   if (!CBB_add_u16(out, TLSEXT_TYPE_dummy_pq_padding) ||
@@ -2351,6 +2421,48 @@ static bool ext_dummy_pq_padding_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
   return CBB_flush(out);
 }
 
+static bool ext_dummy_pq_padding_add_clienthello(SSL_HANDSHAKE *hs, CBB *out) {
+  const size_t len = hs->ssl->dummy_pq_padding_len;
+  if (len == 0) {
+    return true;
+  }
+
+  return ext_dummy_pq_padding_add(out, len);
+}
+
+static bool ext_dummy_pq_padding_parse_serverhello(SSL_HANDSHAKE *hs,
+                                                   uint8_t *out_alert,
+                                                   CBS *contents) {
+  if (contents == nullptr) {
+    return true;
+  }
+
+  if (CBS_len(contents) != hs->ssl->dummy_pq_padding_len) {
+    return false;
+  }
+
+  hs->ssl->did_dummy_pq_padding = true;
+  return true;
+}
+
+static bool ext_dummy_pq_padding_parse_clienthello(SSL_HANDSHAKE *hs,
+                                                   uint8_t *out_alert,
+                                                   CBS *contents) {
+  if (contents != nullptr &&
+      0 < CBS_len(contents) && CBS_len(contents) < (1 << 12)) {
+    hs->dummy_pq_padding_len = CBS_len(contents);
+  }
+
+  return true;
+}
+
+static bool ext_dummy_pq_padding_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+  if (!hs->dummy_pq_padding_len) {
+    return true;
+  }
+
+  return ext_dummy_pq_padding_add(out, hs->dummy_pq_padding_len);
+}
 
 // Negotiated Groups
 //
@@ -2496,8 +2608,8 @@ static bool ext_token_binding_parse_serverhello(SSL_HANDSHAKE *hs,
 
   for (size_t i = 0; i < ssl->token_binding_params_len; ++i) {
     if (param == ssl->token_binding_params[i]) {
-      ssl->negotiated_token_binding_param = param;
-      ssl->token_binding_negotiated = true;
+      ssl->s3->negotiated_token_binding_param = param;
+      ssl->s3->token_binding_negotiated = true;
       return true;
     }
   }
@@ -2515,7 +2627,7 @@ static bool select_tb_param(SSL *ssl, Span<const uint8_t> peer_params) {
     uint8_t tb_param = ssl->token_binding_params[i];
     for (uint8_t peer_param : peer_params) {
       if (tb_param == peer_param) {
-        ssl->negotiated_token_binding_param = tb_param;
+        ssl->s3->negotiated_token_binding_param = tb_param;
         return true;
       }
     }
@@ -2555,14 +2667,14 @@ static bool ext_token_binding_parse_clienthello(SSL_HANDSHAKE *hs,
     return true;
   }
 
-  ssl->token_binding_negotiated = true;
+  ssl->s3->token_binding_negotiated = true;
   return true;
 }
 
 static bool ext_token_binding_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
   SSL *const ssl = hs->ssl;
 
-  if (!ssl->token_binding_negotiated) {
+  if (!ssl->s3->token_binding_negotiated) {
     return true;
   }
 
@@ -2571,7 +2683,7 @@ static bool ext_token_binding_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
       !CBB_add_u16_length_prefixed(out, &contents) ||
       !CBB_add_u16(&contents, hs->negotiated_token_binding_version) ||
       !CBB_add_u8_length_prefixed(&contents, &params) ||
-      !CBB_add_u8(&params, ssl->negotiated_token_binding_param) ||
+      !CBB_add_u8(&params, ssl->s3->negotiated_token_binding_param) ||
       !CBB_flush(out)) {
     return false;
   }
@@ -2694,6 +2806,14 @@ static const struct tls_extension kExtensions[] = {
     dont_add_serverhello,
   },
   {
+    TLSEXT_TYPE_signature_algorithms_cert,
+    NULL,
+    ext_sigalgs_cert_add_clienthello,
+    forbid_parse_serverhello,
+    ignore_parse_clienthello,
+    dont_add_serverhello,
+  },
+  {
     TLSEXT_TYPE_status_request,
     NULL,
     ext_ocsp_add_clienthello,
@@ -2794,9 +2914,9 @@ static const struct tls_extension kExtensions[] = {
     TLSEXT_TYPE_dummy_pq_padding,
     NULL,
     ext_dummy_pq_padding_add_clienthello,
-    ignore_parse_serverhello,
-    ignore_parse_clienthello,
-    dont_add_serverhello,
+    ext_dummy_pq_padding_parse_serverhello,
+    ext_dummy_pq_padding_parse_clienthello,
+    ext_dummy_pq_padding_add_serverhello,
   },
   {
     TLSEXT_TYPE_quic_transport_parameters,
@@ -3188,7 +3308,7 @@ static int ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, CBS *cbs,
 static int ssl_check_clienthello_tlsext(SSL_HANDSHAKE *hs) {
   SSL *const ssl = hs->ssl;
 
-  if (ssl->token_binding_negotiated &&
+  if (ssl->s3->token_binding_negotiated &&
       !(SSL_get_secure_renegotiation_support(ssl) &&
         SSL_get_extms_support(ssl))) {
     OPENSSL_PUT_ERROR(SSL, SSL_R_NEGOTIATED_TB_WITHOUT_EMS_OR_RI);
@@ -3468,8 +3588,8 @@ bool tls1_choose_signature_algorithm(SSL_HANDSHAKE *hs, uint16_t *out) {
   }
 
   Span<const uint16_t> sigalgs = kSignSignatureAlgorithms;
-  if (cert->sigalgs != nullptr) {
-    sigalgs = MakeConstSpan(cert->sigalgs, cert->num_sigalgs);
+  if (!cert->sigalgs.empty()) {
+    sigalgs = cert->sigalgs;
   }
 
   Span<const uint16_t> peer_sigalgs = hs->peer_sigalgs;
@@ -3742,6 +3862,10 @@ int SSL_early_callback_ctx_extension_get(const SSL_CLIENT_HELLO *client_hello,
 
 void SSL_CTX_set_ed25519_enabled(SSL_CTX *ctx, int enabled) {
   ctx->ed25519_enabled = !!enabled;
+}
+
+void SSL_CTX_set_rsa_pss_rsae_certs_enabled(SSL_CTX *ctx, int enabled) {
+  ctx->rsa_pss_rsae_certs_enabled = !!enabled;
 }
 
 int SSL_extension_supported(unsigned extension_value) {

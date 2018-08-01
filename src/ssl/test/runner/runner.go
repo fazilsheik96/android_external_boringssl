@@ -1210,21 +1210,11 @@ func runTest(test *testCase, shimPath string, mallocNumToFail int64) error {
 	if *useGDB {
 		childErr = <-waitChan
 	} else {
-		var shimKilledLock sync.Mutex
-		var shimKilled bool
 		waitTimeout := time.AfterFunc(*idleTimeout, func() {
-			shimKilledLock.Lock()
-			shimKilled = true
-			shimKilledLock.Unlock()
 			shim.Process.Kill()
 		})
 		childErr = <-waitChan
 		waitTimeout.Stop()
-		shimKilledLock.Lock()
-		if shimKilled && err == nil {
-			err = errors.New("timeout waiting for the shim to exit.")
-		}
-		shimKilledLock.Unlock()
 	}
 
 	var isValgrindError, mustFail bool
@@ -1377,6 +1367,13 @@ var tlsVersions = []tlsVersion{
 		excludeFlag:  "-no-tls13",
 		versionWire:  tls13Draft23Version,
 		tls13Variant: TLS13Draft23,
+	},
+	{
+		name:         "TLS13Draft28",
+		version:      VersionTLS13,
+		excludeFlag:  "-no-tls13",
+		versionWire:  tls13Draft28Version,
+		tls13Variant: TLS13Draft28,
 	},
 }
 
@@ -5389,16 +5386,12 @@ func addVersionNegotiationTests() {
 					expectedVersion = runnerVers.version
 				}
 				// When running and shim have different TLS 1.3 variants enabled,
-				// shim clients are expected to fall back to TLS 1.2, while shim
-				// servers support multiple variants.
-				expectedServerVersion := expectedVersion
-				expectedClientVersion := expectedVersion
+				// shim peers are expected to fall back to TLS 1.2.
 				if expectedVersion == VersionTLS13 && runnerVers.tls13Variant != shimVers.tls13Variant {
-					expectedClientVersion = VersionTLS12
-					if shimVers.tls13Variant == TLS13Draft23 {
-						expectedServerVersion = VersionTLS12
-					}
+					expectedVersion = VersionTLS12
 				}
+				expectedClientVersion := expectedVersion
+				expectedServerVersion := expectedVersion
 
 				suffix := shimVers.name + "-" + runnerVers.name
 				if protocol == dtls {
@@ -7343,23 +7336,40 @@ func addExtensionTests() {
 			continue
 		}
 
-		for _, paddingLen := range []int{1, 9700} {
-			flags := []string{
-				"-max-version", version.shimFlag(tls),
-				"-dummy-pq-padding-len", strconv.Itoa(paddingLen),
-			}
-
+		for _, paddingLen := range []int{400, 1100} {
 			testCases = append(testCases, testCase{
-				name:         fmt.Sprintf("DummyPQPadding-%d-%s", paddingLen, version.name),
-				testType:     clientTest,
-				tls13Variant: version.tls13Variant,
+				name:          fmt.Sprintf("DummyPQPadding-%d-%s", paddingLen, version.name),
+				testType:      clientTest,
+				tls13Variant:  version.tls13Variant,
+				resumeSession: true,
 				config: Config{
 					MaxVersion: version.version,
 					Bugs: ProtocolBugs{
 						ExpectDummyPQPaddingLength: paddingLen,
 					},
 				},
-				flags: flags,
+				flags: []string{
+					"-max-version", version.shimFlag(tls),
+					"-dummy-pq-padding-len", strconv.Itoa(paddingLen),
+					"-expect-dummy-pq-padding",
+				},
+			})
+
+			testCases = append(testCases, testCase{
+				name:          fmt.Sprintf("DummyPQPadding-Server-%d-%s", paddingLen, version.name),
+				testType:      serverTest,
+				tls13Variant:  version.tls13Variant,
+				resumeSession: true,
+				config: Config{
+					MaxVersion: version.version,
+					Bugs: ProtocolBugs{
+						SendDummyPQPaddingLength:   paddingLen,
+						ExpectDummyPQPaddingLength: paddingLen,
+					},
+				},
+				flags: []string{
+					"-max-version", version.shimFlag(tls),
+				},
 			})
 		}
 	}
@@ -9436,6 +9446,119 @@ func addSignatureAlgorithmTests() {
 			"-verify-prefs", strconv.Itoa(int(signatureEd25519)),
 		},
 	})
+
+	rsaPSSSupportTests := []struct {
+		name                string
+		expectRSAPSSSupport RSAPSSSupport
+		verifyPrefs         []signatureAlgorithm
+		noCerts             bool
+	}{
+		// By default, RSA-PSS is fully advertised.
+		{
+			name:                "Default",
+			expectRSAPSSSupport: RSAPSSSupportBoth,
+		},
+		// Disabling RSA-PSS certificates makes it online-signature-only.
+		{
+			name:                "Default-NoCerts",
+			expectRSAPSSSupport: RSAPSSSupportOnlineSignatureOnly,
+			noCerts:             true,
+		},
+		// The above also apply if verify preferences were explicitly configured.
+		{
+			name:                "ConfigPSS",
+			expectRSAPSSSupport: RSAPSSSupportBoth,
+			verifyPrefs:         []signatureAlgorithm{signatureRSAPSSWithSHA256, signatureRSAPKCS1WithSHA256, signatureECDSAWithP256AndSHA256},
+		},
+		{
+			name:                "ConfigPSS-NoCerts",
+			expectRSAPSSSupport: RSAPSSSupportOnlineSignatureOnly,
+			verifyPrefs:         []signatureAlgorithm{signatureRSAPSSWithSHA256, signatureRSAPKCS1WithSHA256, signatureECDSAWithP256AndSHA256},
+			noCerts:             true,
+		},
+		// If verify preferences were explicitly configured without RSA-PSS support,
+		// NoCerts is a no-op and the shim correctly only sends one extension.
+		// (This is checked internally in the runner.)
+		{
+			name:                "ConfigNoPSS",
+			expectRSAPSSSupport: RSAPSSSupportNone,
+			verifyPrefs:         []signatureAlgorithm{signatureRSAPKCS1WithSHA256, signatureECDSAWithP256AndSHA256},
+		},
+		{
+			name:                "ConfigNoPSS-NoCerts",
+			expectRSAPSSSupport: RSAPSSSupportNone,
+			verifyPrefs:         []signatureAlgorithm{signatureRSAPKCS1WithSHA256, signatureECDSAWithP256AndSHA256},
+			noCerts:             true,
+		},
+	}
+
+	for _, test := range rsaPSSSupportTests {
+		var pssFlags []string
+		for _, pref := range test.verifyPrefs {
+			pssFlags = append(pssFlags, "-verify-prefs", strconv.Itoa(int(pref)))
+		}
+		if test.noCerts {
+			pssFlags = append(pssFlags, "-no-rsa-pss-rsae-certs")
+		}
+		for _, ver := range tlsVersions {
+			if ver.version < VersionTLS12 {
+				continue
+			}
+
+			// TLS 1.2 cannot express different RSAPSSSupportOnlineSignatureOnly,
+			// so it decays to RSAPSSSupportNone.
+			expect := test.expectRSAPSSSupport
+			if ver.version < VersionTLS13 && expect == RSAPSSSupportOnlineSignatureOnly {
+				expect = RSAPSSSupportNone
+			}
+
+			// If the configuration results in no RSA-PSS support, the handshake won't complete.
+			// (The test, however, still covers the RSA-PSS assertion.)
+			var localError string
+			var shouldFail bool
+			if ver.version >= VersionTLS13 && expect == RSAPSSSupportNone {
+				shouldFail = true
+				localError = "tls: no common signature algorithms"
+			}
+
+			flags := []string{"-max-version", ver.shimFlag(tls)}
+			flags = append(flags, pssFlags...)
+			testCases = append(testCases, testCase{
+				name: fmt.Sprintf("RSAPSSSupport-%s-%s-Client", test.name, ver.name),
+				config: Config{
+					MinVersion:   ver.version,
+					MaxVersion:   ver.version,
+					Certificates: []Certificate{rsaCertificate},
+					Bugs: ProtocolBugs{
+						ExpectRSAPSSSupport: expect,
+					},
+				},
+				tls13Variant:       ver.tls13Variant,
+				flags:              flags,
+				shouldFail:         shouldFail,
+				expectedLocalError: localError,
+			})
+
+			serverFlags := []string{"-require-any-client-certificate"}
+			serverFlags = append(flags, serverFlags...)
+			testCases = append(testCases, testCase{
+				testType: serverTest,
+				name:     fmt.Sprintf("RSAPSSSupport-%s-%s-Server", test.name, ver.name),
+				config: Config{
+					MinVersion:   ver.version,
+					MaxVersion:   ver.version,
+					Certificates: []Certificate{rsaCertificate},
+					Bugs: ProtocolBugs{
+						ExpectRSAPSSSupport: expect,
+					},
+				},
+				tls13Variant:       ver.tls13Variant,
+				flags:              serverFlags,
+				shouldFail:         shouldFail,
+				expectedLocalError: localError,
+			})
+		}
+	}
 }
 
 // timeouts is the retransmit schedule for BoringSSL. It doubles and
@@ -10443,58 +10566,94 @@ const bogusCurve = 0x1234
 
 func addCurveTests() {
 	for _, curve := range testCurves {
-		testCases = append(testCases, testCase{
-			name: "CurveTest-Client-" + curve.name,
-			config: Config{
-				MaxVersion:       VersionTLS12,
-				CipherSuites:     []uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
-				CurvePreferences: []CurveID{curve.id},
-			},
-			flags: []string{
-				"-enable-all-curves",
-				"-expect-curve-id", strconv.Itoa(int(curve.id)),
-			},
-			expectedCurveID: curve.id,
-		})
-		testCases = append(testCases, testCase{
-			name: "CurveTest-Client-" + curve.name + "-TLS13",
-			config: Config{
-				MaxVersion:       VersionTLS13,
-				CurvePreferences: []CurveID{curve.id},
-			},
-			flags: []string{
-				"-enable-all-curves",
-				"-expect-curve-id", strconv.Itoa(int(curve.id)),
-			},
-			expectedCurveID: curve.id,
-		})
-		testCases = append(testCases, testCase{
-			testType: serverTest,
-			name:     "CurveTest-Server-" + curve.name,
-			config: Config{
-				MaxVersion:       VersionTLS12,
-				CipherSuites:     []uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
-				CurvePreferences: []CurveID{curve.id},
-			},
-			flags: []string{
-				"-enable-all-curves",
-				"-expect-curve-id", strconv.Itoa(int(curve.id)),
-			},
-			expectedCurveID: curve.id,
-		})
-		testCases = append(testCases, testCase{
-			testType: serverTest,
-			name:     "CurveTest-Server-" + curve.name + "-TLS13",
-			config: Config{
-				MaxVersion:       VersionTLS13,
-				CurvePreferences: []CurveID{curve.id},
-			},
-			flags: []string{
-				"-enable-all-curves",
-				"-expect-curve-id", strconv.Itoa(int(curve.id)),
-			},
-			expectedCurveID: curve.id,
-		})
+		for _, ver := range tlsVersions {
+			// SSL 3.0 cannot reliably negotiate curves.
+			if ver.version == VersionSSL30 {
+				continue
+			}
+
+			suffix := curve.name + "-" + ver.name
+
+			testCases = append(testCases, testCase{
+				name: "CurveTest-Client-" + suffix,
+				config: Config{
+					MaxVersion: ver.version,
+					CipherSuites: []uint16{
+						TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+						TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+						TLS_AES_128_GCM_SHA256,
+					},
+					CurvePreferences: []CurveID{curve.id},
+				},
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-enable-all-curves",
+					"-expect-curve-id", strconv.Itoa(int(curve.id)),
+				},
+				expectedCurveID: curve.id,
+			})
+			testCases = append(testCases, testCase{
+				testType: serverTest,
+				name:     "CurveTest-Server-" + suffix,
+				config: Config{
+					MaxVersion: ver.version,
+					CipherSuites: []uint16{
+						TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+						TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+						TLS_AES_128_GCM_SHA256,
+					},
+					CurvePreferences: []CurveID{curve.id},
+				},
+				tls13Variant: ver.tls13Variant,
+				flags: []string{
+					"-enable-all-curves",
+					"-expect-curve-id", strconv.Itoa(int(curve.id)),
+				},
+				expectedCurveID: curve.id,
+			})
+
+			if curve.id != CurveX25519 {
+				testCases = append(testCases, testCase{
+					name: "CurveTest-Client-Compressed-" + suffix,
+					config: Config{
+						MaxVersion: ver.version,
+						CipherSuites: []uint16{
+							TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+							TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+							TLS_AES_128_GCM_SHA256,
+						},
+						CurvePreferences: []CurveID{curve.id},
+						Bugs: ProtocolBugs{
+							SendCompressedCoordinates: true,
+						},
+					},
+					tls13Variant:  ver.tls13Variant,
+					flags:         []string{"-enable-all-curves"},
+					shouldFail:    true,
+					expectedError: ":BAD_ECPOINT:",
+				})
+				testCases = append(testCases, testCase{
+					testType: serverTest,
+					name:     "CurveTest-Server-Compressed-" + suffix,
+					config: Config{
+						MaxVersion: ver.version,
+						CipherSuites: []uint16{
+							TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+							TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+							TLS_AES_128_GCM_SHA256,
+						},
+						CurvePreferences: []CurveID{curve.id},
+						Bugs: ProtocolBugs{
+							SendCompressedCoordinates: true,
+						},
+					},
+					tls13Variant:  ver.tls13Variant,
+					flags:         []string{"-enable-all-curves"},
+					shouldFail:    true,
+					expectedError: ":BAD_ECPOINT:",
+				})
+			}
+		}
 	}
 
 	// The server must be tolerant to bogus curves.
@@ -10630,7 +10789,7 @@ func addCurveTests() {
 			},
 		},
 		shouldFail:    true,
-		expectedError: ":INVALID_ENCODING:",
+		expectedError: ":BAD_ECPOINT:",
 	})
 	testCases = append(testCases, testCase{
 		name: "InvalidECDHPoint-Client-TLS13",
@@ -10642,7 +10801,7 @@ func addCurveTests() {
 			},
 		},
 		shouldFail:    true,
-		expectedError: ":INVALID_ENCODING:",
+		expectedError: ":BAD_ECPOINT:",
 	})
 	testCases = append(testCases, testCase{
 		testType: serverTest,
@@ -10656,7 +10815,7 @@ func addCurveTests() {
 			},
 		},
 		shouldFail:    true,
-		expectedError: ":INVALID_ENCODING:",
+		expectedError: ":BAD_ECPOINT:",
 	})
 	testCases = append(testCases, testCase{
 		testType: serverTest,
@@ -10669,7 +10828,7 @@ func addCurveTests() {
 			},
 		},
 		shouldFail:    true,
-		expectedError: ":INVALID_ENCODING:",
+		expectedError: ":BAD_ECPOINT:",
 	})
 
 	// The previous curve ID should be reported on TLS 1.2 resumption.
@@ -10847,6 +11006,22 @@ func addCurveTests() {
 		},
 		shouldFail:    true,
 		expectedError: ":ERROR_PARSING_EXTENSION:",
+	})
+
+	// Implementations should mask off the high order bit in X25519.
+	testCases = append(testCases, testCase{
+		name: "SetX25519HighBit",
+		config: Config{
+			CipherSuites: []uint16{
+				TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+				TLS_AES_128_GCM_SHA256,
+			},
+			CurvePreferences: []CurveID{CurveX25519},
+			Bugs: ProtocolBugs{
+				SetX25519HighBit: true,
+			},
+		},
 	})
 }
 
@@ -11930,7 +12105,10 @@ func addTLS13HandshakeTests() {
 		})
 
 		// Test that the server correctly echoes back session IDs of
-		// various lengths.
+		// various lengths. The first test additionally asserts that
+		// BoringSSL always sends the ChangeCipherSpec messages for
+		// compatibility mode, rather than negotiating it based on the
+		// ClientHello.
 		testCases = append(testCases, testCase{
 			testType: serverTest,
 			name:     "EmptySessionID-" + name,

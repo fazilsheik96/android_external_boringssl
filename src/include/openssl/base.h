@@ -104,6 +104,10 @@ extern "C" {
 #elif defined(__pnacl__)
 #define OPENSSL_32_BIT
 #define OPENSSL_PNACL
+#elif defined(__wasm__)
+#define OPENSSL_32_BIT
+#elif defined(__asmjs__)
+#define OPENSSL_32_BIT
 #elif defined(__myriad2__)
 #define OPENSSL_32_BIT
 #else
@@ -151,7 +155,7 @@ extern "C" {
 // A consumer may use this symbol in the preprocessor to temporarily build
 // against multiple revisions of BoringSSL at the same time. It is not
 // recommended to do so for longer than is necessary.
-#define BORINGSSL_API_VERSION 7
+#define BORINGSSL_API_VERSION 8
 
 #if defined(BORINGSSL_SHARED_LIBRARY)
 

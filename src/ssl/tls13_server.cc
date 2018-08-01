@@ -391,7 +391,7 @@ static enum ssl_hs_wait_t do_select_session(SSL_HANDSHAKE *hs) {
           // Channel ID is incompatible with 0-RTT.
           !ssl->s3->tlsext_channel_id_valid &&
           // If Token Binding is negotiated, reject 0-RTT.
-          !ssl->token_binding_negotiated &&
+          !ssl->s3->token_binding_negotiated &&
           // Custom extensions is incompatible with 0-RTT.
           hs->custom_extensions.received == 0 &&
           // The negotiated ALPN must match the one in the ticket.
@@ -619,8 +619,20 @@ static enum ssl_hs_wait_t do_send_server_hello(SSL_HANDSHAKE *hs) {
         !CBB_add_u16_length_prefixed(&cert_request_extensions,
                                      &sigalg_contents) ||
         !CBB_add_u16_length_prefixed(&sigalg_contents, &sigalgs_cbb) ||
-        !tls12_add_verify_sigalgs(ssl, &sigalgs_cbb)) {
+        !tls12_add_verify_sigalgs(ssl, &sigalgs_cbb,
+                                  false /* online signature */)) {
       return ssl_hs_error;
+    }
+
+    if (tls12_has_different_verify_sigalgs_for_certs(ssl)) {
+      if (!CBB_add_u16(&cert_request_extensions,
+                       TLSEXT_TYPE_signature_algorithms_cert) ||
+          !CBB_add_u16_length_prefixed(&cert_request_extensions,
+                                       &sigalg_contents) ||
+          !CBB_add_u16_length_prefixed(&sigalg_contents, &sigalgs_cbb) ||
+          !tls12_add_verify_sigalgs(ssl, &sigalgs_cbb, true /* certs */)) {
+        return ssl_hs_error;
+      }
     }
 
     if (ssl_has_client_CAs(ssl)) {

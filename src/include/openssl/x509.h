@@ -531,6 +531,8 @@ extern "C" {
 #define		X509_get_signature_type(x) EVP_PKEY_type(OBJ_obj2nid((x)->sig_alg->algorithm))
 
 #define		X509_CRL_get_version(x) ASN1_INTEGER_get((x)->crl->version)
+const ASN1_TIME *X509_CRL_get0_lastUpdate(const X509_CRL *crl);
+const ASN1_TIME *X509_CRL_get0_nextUpdate(const X509_CRL *crl);
 #define 	X509_CRL_get_lastUpdate(x) ((x)->crl->lastUpdate)
 #define 	X509_CRL_get_nextUpdate(x) ((x)->crl->nextUpdate)
 #define		X509_CRL_get_issuer(x) ((x)->crl->issuer)
@@ -1127,7 +1129,7 @@ DECLARE_ASN1_FUNCTIONS(RSA_PSS_PARAMS)
 #if !defined(BORINGSSL_NO_CXX)
 extern "C++" {
 
-namespace bssl {
+BSSL_NAMESPACE_BEGIN
 
 BORINGSSL_MAKE_DELETER(NETSCAPE_SPKI, NETSCAPE_SPKI_free)
 BORINGSSL_MAKE_DELETER(RSA_PSS_PARAMS, RSA_PSS_PARAMS_free)
@@ -1156,7 +1158,7 @@ using ScopedX509_STORE_CTX =
     internal::StackAllocated<X509_STORE_CTX, void, X509_STORE_CTX_zero,
                              X509_STORE_CTX_cleanup>;
 
-}  // namespace bssl
+BSSL_NAMESPACE_END
 
 }  /* extern C++ */
 #endif  /* !BORINGSSL_NO_CXX */

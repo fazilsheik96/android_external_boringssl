@@ -60,8 +60,6 @@ cc_defaults {
         "-Werror",
     ],
 
-    c_std: "gnu11",
-
     // Build BoringSSL and its tests against the same STL.
     sdk_version: "9",
     target: {
@@ -367,6 +365,7 @@ cc_library {
         "com.android.adbd",
         "com.android.conscrypt",
         "com.android.resolv",
+        "com.android.virt",
     ],
     min_sdk_version: "29",
 }
@@ -600,6 +599,10 @@ rust_bindgen {
         "libcrypto",
         "libssl",
     ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
 }
 
 cc_library_static {
@@ -610,6 +613,10 @@ cc_library_static {
     shared_libs: [
         "libcrypto",
         "libssl",
+    ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
     ],
 }
 
@@ -624,5 +631,9 @@ rust_library {
     rlibs: ["libbssl_sys_raw"],
     static_libs: [
         "libbssl_rust_support",
+    ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
     ],
 }
